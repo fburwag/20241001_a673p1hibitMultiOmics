@@ -1,0 +1,1519 @@
+---
+title: "dataAnalysis"
+author: "Fares Burwag"
+date: "11/09/2024"
+output: html_document
+---
+
+
+```{r libraries and global variables}
+library(BiocManager)
+library(tidyverse)
+library(biomaRt)
+library(limma)
+library(fgsea)
+# library(tidymodels)
+library(ggrepel)
+library(ggpp)
+library(pheatmap)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(preprocessCore)
+library(readxl)
+library(RColorBrewer)
+# library(IsoformSwitchAnalyzeR)
+library(idpr)
+library(GO.db)
+
+# library(ConsensusClusterPlus)
+absPath_wd <- "/Users/fburwag/Desktop/analysisWorkspace/hibitRip/"
+absPath_seqFiles <- paste0(absPath_wd,"/dataFiles/sequencing20230630_a673p1Ybx1Hibit/")
+# absPath_wd <- "/WorkFiles/20241201_analysisWorkspaceBackup/analysisWorkspace/hibitRip/"
+# absPath_seqFiles <- paste0(absPath_wd,"/dataFiles/sequencing20230630_a673p1Ybx1Hibit/")
+# absPath_wd <- "/Users/faresburwag/Desktop/BioinformaticsLearning/hibitRip/"
+# absPath_seqFiles <- paste0(absPath_wd,"dataFiles/sequencing20230630_a673p1Ybx1Hibit/")
+
+## Sample minimum imputation
+replace_lowest_x <- function(x){
+  replace(x, list = which(is.na(x)), values = sample(x[x <= quantile(x, 0.01, na.rm = T) & !is.na(x)], size = sum(is.na(x)),replace = T))
+}
+
+```
+
+```{r loading in omics data}
+
+genes <- read_tsv(paste0(absPath_wd, "dataFiles/ensemblTranscriptIDgeneSymbol.tsv"))
+genes_unique <- genes[,c("external_gene_name","uniprotswissprot")] %>%
+  dplyr::group_by(external_gene_name, uniprotswissprot) %>%
+  na.omit() %>% 
+  dplyr::slice(1)
+aggProteome_data <- read_tsv(paste0(absPath_wd,"dataFiles/proteomics20230410_a673p1Ybx1HibitTotalProteome/dataset_processedMbrA673p1Ybx1HibitTotalProteome.tsv"))
+
+# aggYb1Interactome_data <- read_tsv(paste0(absPath_wd,"dataFiles/proteomics20230410_a673p1Ybx1HibitTotalProteome/dataset_processedMbrA673p1Ybx1HibitTotalProteome.tsv"))
+
+aggData_processed <- read_tsv(paste0(absPath_wd,"dataFiles/aggregatedSeqData.tsv"))
+
+aggData_temp <- genes %>%
+  merge(aggData_processed, all.x = TRUE,by.x ="ensembl_transcript_id_version", by.y = "Name") %>%
+  filter(!is.na(uniprotswissprot)) %>%
+  dplyr::select("gene_symbol" = external_gene_name, uniprotswissprot, ensembl_transcript_id_version, contains("TPM")) %>%
+  group_by(uniprotswissprot) %>%
+  summarize(across(where(is.numeric), function(x) sum(x, na.rm = T)))
+
+aggData_repCollapse <- data.frame(uniprotswissid = aggData_temp$uniprotswissprot)
+tempList <- str_match(colnames(aggData_temp), "TPM_(.*)[1-3]")[,2] %>% na.omit() %>% unique()
+for (condition in tempList){
+  aggData_repCollapse[condition] <- aggData_temp %>% dplyr::select(contains(condition)) %>% apply(1,function(x) mean(x, na.rm = TRUE))
+}
+aggDataSum_repCollapse <- aggData_repCollapse %>% 
+  merge(genes[,c("external_gene_name", "uniprotswissprot")], all.x = TRUE, by.x = "uniprotswissid", by.y = "uniprotswissprot") %>%
+  dplyr::select(-uniprotswissid) %>%
+  group_by(external_gene_name) %>%
+  summarize(across(everything(), function(x) sum(x, na.rm = TRUE)))
+
+aggTotal_data <- aggData_temp[,grepl("TPM.*Total.*",colnames(aggData_temp))]
+colnames(aggTotal_data) <- str_match(colnames(aggTotal_data),"_(.*)$")[,2]
+aggTotal_data <- cbind(aggData_temp[,1], aggTotal_data)
+
+aggRIP_data <- aggData_temp[,grepl("TPM.*(RIP|input).*",colnames(aggData_temp), ignore.case = T)]
+colnames(aggRIP_data) <- str_match(colnames(aggRIP_data),"_(.*)$")[,2]
+aggRIP_data <- cbind(aggData_temp[,1], aggRIP_data)
+
+aggPolysome_data <- aggData_temp[,grepl("TPM.*Poly.*",colnames(aggData_temp))]
+colnames(aggPolysome_data) <- str_match(colnames(aggPolysome_data),"_(.*)$")[,2]
+aggPolysome_data <- cbind(aggData_temp[,1], aggPolysome_data)
+
+
+# ### Generate plots for library depth
+# for (sampleType in c("Poly", "Total", "Rip")){
+#   loop_figure <- aggData_temp[,grepl(paste0("NumReads.*(",sampleType,"|Input)"), colnames(aggData_temp))] %>%
+#   map_df(function(x){log10(sum(x, na.rm = T))}) %>%
+#   pivot_longer(cols = everything(),names_pattern = "(dmso|ms275|ars|combo|Input|negRip)") %>%
+#   mutate(name = factor(name, levels = c("Input", "negRip","dmso", "ars", "ms275", "combo"))) %>% 
+#   ggplot(aes(x = name, y = value))+
+#   geom_boxplot()+
+#   geom_point()+
+#   ggtitle("Log-transformed read counts (Polysome Data)")+
+#   labs(x = "Treatment", y = "Log10(Total Reads)")
+#   
+#   ggsave(paste0(absPath_wd,"/plots/",sampleType,"_logTransformedDepth.jpg"), loop_figure)
+# }
+
+```
+
+```{r rnaIP differential expression}
+
+geneRIP_data <- aggRIP_data
+sampleLabels <- c(str_match(colnames(geneRIP_data)[4:ncol(geneRIP_data)],"(.*)Rip.")[,2])
+
+designMat <- model.matrix(~0+sampleLabels,
+                            data=geneRIP_data[,4:ncol(geneRIP_data)])
+colnames(designMat) = gsub('sampleLabels','',colnames(designMat))
+
+limmaDataMat <- geneRIP_data[,c(1,4:ncol(geneRIP_data))] %>%
+  column_to_rownames("uniprotswissprot") %>%
+  apply(2,function(x){log2(x+0.1)}) %>%
+  as.data.frame()
+Rip_fit = lmFit(limmaDataMat, design = designMat)
+
+contrasts <- apply(combn(rev(unique(sampleLabels)), 2), 2, function(x) paste0(x[1],"-",x[2]))
+
+contrast.matrix = makeContrasts(contrasts = contrasts, levels=designMat)
+Rip_fit = contrasts.fit(Rip_fit, contrast.matrix)
+Rip_fit = eBayes(Rip_fit)
+
+write_tsv(topTable(Rip_fit, coef = "ars-dmso", number = 10^7),
+          paste0(absPath_wd, "dataFiles/diffExpression_rnaIP_arsDmso.tsv"))
+
+```
+
+```{r totalmRNA differential expression}
+
+geneTotal_data <- aggTotal_data
+
+# merge(genes, aggRIP_data, all.x = TRUE, by.x = "ensembl_transcript_id_version", by.y = "Name")
+
+sampleLabels <- c(str_match(colnames(geneTotal_data)[2:ncol(geneTotal_data)],"(.*)Total.")[,2])
+
+designMat <- model.matrix(~0+sampleLabels,
+                            data=geneTotal_data[,2:ncol(geneTotal_data)])
+colnames(designMat) = gsub('sampleLabels','',colnames(designMat))
+
+limmaDataMat <- geneTotal_data[,c(1,2:ncol(geneTotal_data))] %>%
+  column_to_rownames("uniprotswissprot") %>%
+  apply(2,function(x){log2(x+0.1)}) %>%
+  as.data.frame()
+totalmRNA_fit = lmFit(limmaDataMat, design = designMat)
+
+contrasts <- apply(combn(rev(unique(sampleLabels)), 2), 2, function(x) paste0(x[1],"-",x[2]))
+
+contrast.matrix = makeContrasts(contrasts = contrasts, levels=designMat)
+totalmRNA_fit = contrasts.fit(totalmRNA_fit, contrast.matrix)
+totalmRNA_fit = eBayes(totalmRNA_fit)
+
+# write_tsv(topTable(totalmRNA_fit, coef = "ars-dmso", number = 10^7),
+#           paste0(absPath_wd, "dataFiles/diffExpression_totalmRNA_arsDmso.tsv"))
+
+```
+
+```{r polysome differential expression}
+
+genePolysome_data <- aggPolysome_data
+
+# merge(genes, aggRIP_data, all.x = TRUE, by.x = "ensembl_transcript_id_version", by.y = "Name")
+
+sampleLabels <- c(str_match(colnames(genePolysome_data)[2:ncol(genePolysome_data)],"(.*)Poly.")[,2])
+
+designMat <- model.matrix(~0+sampleLabels,
+                            data=genePolysome_data[,2:ncol(genePolysome_data)])
+colnames(designMat) = gsub('sampleLabels','',colnames(designMat))
+
+limmaDataMat <- genePolysome_data[,c(1,2:ncol(genePolysome_data))] %>%
+  column_to_rownames("uniprotswissprot") %>%
+  apply(2,function(x){log2(x+0.1)}) %>%
+  as.data.frame()
+polysome_fit = lmFit(limmaDataMat, design = designMat)
+
+contrasts <- apply(combn(rev(unique(sampleLabels)), 2), 2, function(x) paste0(x[1],"-",x[2]))
+
+contrast.matrix = makeContrasts(contrasts = contrasts, levels=designMat)
+polysome_fit = contrasts.fit(polysome_fit, contrast.matrix)
+polysome_fit = eBayes(polysome_fit)
+
+# write_tsv(topTable(polysome_fit, coef = "ars-dmso", number = 10^7),
+#           paste0(absPath_wd, "dataFiles/diffExpression_polysome_arsDmso.tsv"))
+
+```
+
+```{r totalmRNA differential expression - All genes}
+
+# geneTotal_data <- aggData_processed
+# geneTotal_data <- geneTotal_data[,c(grepl("Name|TPM_.*Total",colnames(geneTotal_data)))]
+# 
+# # merge(genes, aggRIP_data, all.x = TRUE, by.x = "ensembl_transcript_id_version", by.y = "Name")
+# 
+# sampleLabels <- c(str_match(colnames(geneTotal_data)[2:ncol(geneTotal_data)],"TPM_(.*)Total.")[,2])
+# 
+# designMat <- model.matrix(~0+sampleLabels,
+#                             data=geneTotal_data[,2:ncol(geneTotal_data)])
+# colnames(designMat) = gsub('sampleLabels','',colnames(designMat))
+# 
+# limmaDataMat <- geneTotal_data[,c(1,2:ncol(geneTotal_data))] %>%
+#   column_to_rownames("Name") %>%
+#   apply(2,function(x){log2(x+0.1)}) %>%
+#   as.data.frame()
+# totalmRNA_fit = lmFit(limmaDataMat, design = designMat)
+# 
+# contrasts <- apply(combn(rev(unique(sampleLabels)), 2), 2, function(x) paste0(x[1],"-",x[2]))
+# 
+# contrast.matrix = makeContrasts(contrasts = contrasts, levels=designMat)
+# totalmRNA_fit = contrasts.fit(totalmRNA_fit, contrast.matrix)
+# totalmRNA_fit = eBayes(totalmRNA_fit)
+# 
+# # write_tsv(topTable(totalmRNA_fit, coef = "ars-dmso", number = 10^7) %>%
+# #             rownames_to_column("TranscriptID") %>%
+# #             merge(genes, all.x = TRUE, by.x = "TranscriptID", by.y = "ensembl_transcript_id_version"),
+# #           paste0(absPath_wd, "dataFiles/diffExpression_allGenesTotalmRNA_arsDmso.tsv"))
+
+```
+
+```{r Ybx1 IPMS differential expression}
+
+aggYbx1Ipms_data <- read_tsv(paste0(absPath_wd, "dataFiles/proteomics20240923_a673p1Ybx1ProteinIP_reanalyzed/Ybx1HibitOmics_IPMS_reportParsedIqQuant.tsv"))
+## Investigate signal distribution of log-transformed intensities. Neg has lowest, but there is need to normalize across samples.
+# as.matrix(aggYbx1Ipms_data[,5:ncol(aggYbx1Ipms_data)]) %>% boxplot.matrix()
+
+## First let's impute with SampMin and apply a median normalization
+aggYbx1IpmsNormalized_data <- aggYbx1Ipms_data
+## SampMin imputation, don't apply to negative control
+aggYbx1IpmsNormalized_data[,c(5:16)] <- aggYbx1IpmsNormalized_data[,c(5:16)] %>% apply(2, function(x) replace_lowest_x(x))
+## Quantile normalization, don't apply to negative control
+aggYbx1IpmsNormalized_data[,c(5:16)] <- normalize.quantiles(aggYbx1IpmsNormalized_data[,c(5:16)] %>% as.matrix())
+## Check distribution
+# as.matrix(aggYbx1IpmsNormalized_data[,5:ncol(aggYbx1IpmsNormalized_data)]) %>% boxplot.matrix()
+## Exclude negative control for now
+aggYbx1IpmsNormalized_data <- aggYbx1IpmsNormalized_data[,-ncol(aggYbx1IpmsNormalized_data)]
+
+sampleLabels <- c(str_match(colnames(aggYbx1IpmsNormalized_data)[5:ncol(aggYbx1IpmsNormalized_data)],"(.*)_rep")[,2])
+
+designMat <- model.matrix(~0+sampleLabels,
+                            data=aggYbx1IpmsNormalized_data[,5:ncol(aggYbx1IpmsNormalized_data)])
+colnames(designMat) = gsub('sampleLabels','',colnames(designMat))
+
+limmaDataMat <- aggYbx1IpmsNormalized_data[,c(1,5:ncol(aggYbx1IpmsNormalized_data))] %>%
+  column_to_rownames("Protein.Group") %>%
+  as.data.frame()
+Ybx1IPMS_fit = lmFit(limmaDataMat, design = designMat)
+
+contrasts <- apply(combn(c("combo", "ms275", "ars", "dmso"), 2), 2, function(x) paste0(x[1],"-",x[2]))
+
+contrast.matrix = makeContrasts(contrasts = contrasts, levels=designMat)
+Ybx1IPMS_fit = contrasts.fit(Ybx1IPMS_fit, contrast.matrix)
+Ybx1IPMS_fit = eBayes(Ybx1IPMS_fit)
+
+# write_tsv(topTable(Ybx1IPMS_fit, coef = "ars-dmso", number = 10^7),
+#           paste0(absPath_wd, "dataFiles/diffExpression_ybx1Interactome_arsDmso.tsv"))
+
+```
+
+What do I expect to see? My main interest is YB-1's role in:
+1. driving enhanced translation of cytoprotective genes under oxidative stress.
+2. sequestering transcripts in stress granules
+For the above cases, I would like to characterize how cells respond to MS275 treatment (combo)
+
+```{r concatenating all differential matrices}
+
+### Concatenate all logFC data into a single matrix.
+
+sampleLabels <- c(str_match(colnames(genePolysome_data)[2:ncol(genePolysome_data)],"(.*)Poly.")[,2])
+contrasts <- apply(combn(rev(unique(sampleLabels)), 2), 2, function(x) paste0(x[1],"-",x[2]))
+contrasts <- c(contrasts[grepl("dmso", contrasts)], "combo-ars")
+categories <- c("Rip","totalmRNA","polysome")
+
+remove(yb1A673p1Hibit_dataMatrix)
+for (comparison in contrasts){
+  loop_name <- gsub("-(.)", "\\1",comparison)
+  for (dataCat in categories){
+    if (!exists("yb1A673p1Hibit_dataMatrix")){
+      loop_lfc <- paste0(loop_name,dataCat,"_TPMlogFC")
+      loop_adj <- paste0(loop_name,dataCat,"_TPMadjpVal")
+      yb1A673p1Hibit_dataMatrix <- get(paste0(dataCat,"_fit")) %>%
+        topTable(coef=comparison, sort.by = "P", number = 10^7) %>% 
+        dplyr::select(!!loop_lfc := logFC, !!loop_adj := adj.P.Val) %>%
+        rownames_to_column("uniprot_id")
+    }
+    else{
+      loop_lfc <- paste0(loop_name,dataCat,"_TPMlogFC")
+      loop_adj <- paste0(loop_name,dataCat,"_TPMadjpVal")
+      loopMatrix <- get(paste0(dataCat,"_fit")) %>%
+        topTable(coef=comparison, sort.by = "P", number = 10^7) %>% 
+        dplyr::select(!!loop_lfc := logFC, !!loop_adj := adj.P.Val) %>%
+        rownames_to_column("uniprot_id")
+      yb1A673p1Hibit_dataMatrix <- yb1A673p1Hibit_dataMatrix  %>%
+        merge(loopMatrix, all.x = TRUE, by = "uniprot_id")
+    }
+  }
+  ### Proteome operations must be handled due to different directory organization
+  loop_lfc <- paste0(loop_name,"proteome_logFC")
+  loop_adj <- paste0(loop_name,"proteome_adjpVal")
+  loopProteome <- read_tsv(paste0(absPath_wd,"/dataFiles/proteomics20230410_a673p1Ybx1HibitTotalProteome/dataset_deqmsMbr_", comparison,".tsv")) %>%
+        dplyr::select(accession, !!loop_lfc := logFC, !!loop_adj := adj.P.Val)
+  yb1A673p1Hibit_dataMatrix <- merge(yb1A673p1Hibit_dataMatrix, loopProteome,
+                                     all.x = TRUE, by.x = "uniprot_id", by.y = "accession")
+  ### Add the interactome contrasts
+  loop_lfc <- paste0(loop_name,"Ybx1Int_logFC")
+  loop_adj <- paste0(loop_name,"Ybx1Int_adjpVal")
+  loopInteractome <- topTable(Ybx1IPMS_fit, coef = comparison, number = 10^7, sort.by = "P") %>%
+    dplyr::select(!!loop_lfc := logFC, !!loop_adj := adj.P.Val) %>%
+    rownames_to_column("uniprot_id")
+  yb1A673p1Hibit_dataMatrix <- merge(yb1A673p1Hibit_dataMatrix, loopInteractome,
+                                     all.x = TRUE, by = "uniprot_id")
+  }
+
+yb1A673p1Hibit_dataMatrix <- yb1A673p1Hibit_dataMatrix %>%
+  merge(genes_unique, 
+        all.x = TRUE, by.x = "uniprot_id", by.y = "uniprotswissprot") %>%
+  dplyr::select(uniprot_id, "gene_symbol" = external_gene_name, colnames(yb1A673p1Hibit_dataMatrix[,-c(1)]))
+
+# write_tsv(yb1A673p1Hibit_dataMatrix,
+#           paste0(absPath_wd, "dataFiles/diffExpressionProteinCoding_aggregateOmics.tsv"))
+
+```
+
+```{r defining gene subsets for scatter plots}
+
+### Let's define fixed parameters/variables
+yb1A673p1Hibit_subset <- yb1A673p1Hibit_dataMatrix
+logFC_threshold <- log2(1.5)
+
+### Columns and categories needed for heatmap generation
+categories <- c("proteome", "polysome", "rip", "totalmRNA")
+df_cols <- c("dmso_rep1", "dmso_rep2", "dmso_rep3",
+               "ms275_rep1", "ms275_rep2", "ms275_rep3",
+               "ars_rep1", "ars_rep2", "ars_rep3",
+               "combo_rep1", "combo_rep2", "combo_rep3")
+
+### Let's subset our genes for later figures.
+### Get significant hits for arsenite-dmso treatment.
+arsdmso_signif <- yb1A673p1Hibit_subset %>% filter(arsdmsoproteome_adjpVal <= 0.05,
+                                       abs(arsdmsoproteome_logFC) > logFC_threshold,
+                                       abs(arsdmsopolysome_TPMlogFC) > logFC_threshold)
+arsdmso_signif_up <- arsdmso_signif %>% filter(arsdmsoproteome_logFC > 0,
+                                               arsdmsopolysome_TPMlogFC > 0)
+arsdmso_signif_down <- arsdmso_signif %>% filter(arsdmsoproteome_logFC < 0,
+                                                 arsdmsopolysome_TPMlogFC < 0)
+
+### Get significant hits for combo-arsenite treatment.
+comboArs_signif <- yb1A673p1Hibit_subset %>% filter(comboarsproteome_adjpVal <= 0.05,
+                                         comboarspolysome_TPMadjpVal <= 0.05,
+                                       abs(comboarsproteome_logFC) > logFC_threshold,
+                                       abs(comboarspolysome_TPMlogFC) > logFC_threshold)
+comboArs_signif_up <- comboArs_signif %>% filter(comboarsproteome_logFC > 0,
+                                                 comboarspolysome_TPMlogFC > 0)
+comboArs_signif_down <- comboArs_signif %>% filter(comboarsproteome_logFC < 0,
+                                                   comboarspolysome_TPMlogFC < 0)
+
+### Get significant hits in YBX1 binding.
+Rip_signif <- yb1A673p1Hibit_subset %>% filter(comboarsRip_TPMadjpVal <= 0.05,
+                                    arsdmsoRip_TPMadjpVal <= 0.05,
+                                    abs(comboarsRip_TPMlogFC) > logFC_threshold,
+                                    abs(arsdmsoRip_TPMlogFC) > logFC_threshold)
+Rip_signif_up <- Rip_signif %>% filter(comboarsRip_TPMlogFC > 0)
+Rip_signif_down <-  Rip_signif %>% filter(comboarsRip_TPMlogFC < 0)
+
+```
+
+In terms of our data, the first goal translates into:
+* Increased proteomic expression, in addition to increased polysome and YB-1 binding following arsenite stress relative to dmso.
+* Decreased proteomic expression, in addition to decreased polysome and YB-1 binding following combo treatment (arsenite and MS275) relative to arsenite only treatment.
+
+```{r creating enhanced translation scatter plots}
+
+labelGenes_translation <- arsdmso_signif_up[arsdmso_signif_up$uniprot_id %in% comboArs_signif_down$uniprot_id,]
+
+contrast_scatterplot <- ggplot(yb1A673p1Hibit_subset, aes(x = arsdmsoproteome_logFC, y = arsdmsopolysome_TPMlogFC))+
+  geom_point(color="gray")+
+  geom_point(data=arsdmso_signif_up,color="#ff7070")+
+  geom_point(data=arsdmso_signif_down,color="#7cb3fc")+
+  geom_point(data = labelGenes_translation, shape = 1, size = 2)+
+  geom_vline(linetype = "dashed", xintercept = logFC_threshold)+
+  geom_vline(linetype = "dashed", xintercept = -logFC_threshold)+
+  geom_hline(linetype = "dashed", yintercept = logFC_threshold)+
+  geom_hline(linetype = "dashed", yintercept = -logFC_threshold)+
+  # xlim(c(-maxFC, maxFC))+
+  geom_text_repel(data = labelGenes_translation,
+                   aes(label = gene_symbol),
+                   size = 2,
+                   force_pull = 2,
+                   force = 20,
+                   position = position_nudge_center(x = 1.5, center_x = 0.2, y = 2, center_y = 1),
+                   min.segment.length = 0,
+                  segment.size = 0.25,
+                   max.iter = 1000,
+                   max.overlaps = 20,
+                  box.padding = 0.2)+
+  ggtitle("Differential Expression - ARSENITE / DMSO")+
+  labs(x="LogFC Proteome (ARS-DMSO)", y="LogFC Polysome (ARS-DMSO)")+
+  theme_minimal()
+ggsave(paste0(absPath_wd,"plots/arsDmsoTranslation_Scatterplot.jpg"),contrast_scatterplot)
+
+contrast_scatterplot <- ggplot(arsdmso_signif_up, aes(x = comboarsproteome_logFC, y = comboarspolysome_TPMlogFC))+
+  geom_point(color="gray")+
+  geom_point(data=arsdmso_signif_up %>%
+               filter(gene_symbol %in% comboArs_signif_up$gene_symbol),
+             color="#ff7070")+
+  geom_point(data=arsdmso_signif_up %>%
+               filter(gene_symbol %in% comboArs_signif_down$gene_symbol),
+             color="#7cb3fc")+
+  geom_point(data = labelGenes_translation, shape = 1, size = 2)+
+  geom_vline(linetype = "dashed", xintercept = -logFC_threshold)+
+  geom_vline(linetype = "dashed", xintercept = logFC_threshold)+
+  geom_hline(linetype = "dashed", yintercept = -logFC_threshold)+
+  geom_hline(linetype = "dashed", yintercept = logFC_threshold)+
+  # xlim(c(-maxFC, maxFC))+
+  geom_text_repel(data = labelGenes_translation,
+                   aes(label = gene_symbol),
+                   size = 2,
+                   force_pull = 2,
+                   force = 20,
+                   position = position_nudge_center(x = 0.3, center_x = -0.3, y = 1, center_y = 0),
+                   min.segment.length = 0,
+                  segment.size = 0.25,
+                   max.iter = 1000,
+                   max.overlaps = 20,
+                  box.padding = 0.2)+
+  ggtitle("Differential Expression - COMBO / ARSENITE")+
+  labs(x="LogFC Proteome (COMBO-ARS)", y="LogFC Polysome (COMBO-ARS)")+
+  theme_minimal()
+
+ggsave(paste0(absPath_wd,"plots/comboArsTranslation_Scatterplot.jpg"),contrast_scatterplot)
+
+contrast_scatterplot <- ggplot(arsdmso_signif_up, aes(x = comboarsRip_TPMlogFC, y = arsdmsoRip_TPMlogFC))+
+  geom_point(color="gray")+
+  geom_point(data=arsdmso_signif_up %>%
+               filter(gene_symbol %in% Rip_signif_up$gene_symbol),
+             color="#ff7070")+
+  geom_point(data=arsdmso_signif_up %>%
+               filter(gene_symbol %in% Rip_signif_down$gene_symbol),
+             color="#7cb3fc")+
+  geom_point(data = labelGenes_translation, shape = 1, size = 2)+
+  geom_vline(linetype = "dashed", xintercept = -logFC_threshold)+
+  geom_vline(linetype = "dashed", xintercept = logFC_threshold)+
+  geom_hline(linetype = "dashed", yintercept = -logFC_threshold)+
+  geom_hline(linetype = "dashed", yintercept = logFC_threshold)+
+  # xlim(c(-maxFC, maxFC))+
+  geom_text_repel(data = labelGenes_translation,
+                   aes(label = gene_symbol),
+                   size = 2,
+                   force_pull = 2,
+                   force = 20,
+                   position = position_nudge_center(x = 0.3, center_x = -0.3, y = 1, center_y = 0),
+                   min.segment.length = 0,
+                  segment.size = 0.25,
+                   max.iter = 1000,
+                   max.overlaps = 20,
+                  box.padding = 0.2)+
+  ggtitle("YB-1 RNA-Immunoprecipitation")+
+  labs(x="LogFC YB-1 RNA-IP (COMBO-ARS)", y="LogFC YB-1 RNA-IP (ARS-DMSO)")+
+  theme_minimal()
+
+ggsave(paste0(absPath_wd,"plots/twoWayTranslationRip_Scatterplot.jpg"),contrast_scatterplot)
+
+```
+
+In the case of the second goal, we anticipate the following trends:
+* Upon arsenite treatment > Increase in YB1 binding, decrease or no change in protein expression, decrease or no change in polysome recruitment relative to dmso
+* Upon MS275 treatment (COMBO) > Increase in polysome recruitment and protein expression relative to arsenite only
+
+```{r creating stress granule scatter plots}
+arsDmso_downregulated <- yb1A673p1Hibit_subset %>%
+  filter(arsdmsoproteome_logFC < -logFC_threshold,
+         arsdmsoproteome_adjpVal <= 0.05)
+
+labelGenes_sg <- arsDmso_downregulated %>%
+  filter(gene_symbol %in% comboArs_signif_up$gene_symbol)
+
+contrast_scatterplot <- ggplot(yb1A673p1Hibit_subset, aes(x = arsdmsoproteome_logFC, y = arsdmsopolysome_TPMlogFC))+
+  geom_point(color="gray")+
+  geom_point(data=arsdmso_signif_up,color="#ff7070")+
+  geom_point(data=arsdmso_signif_down,color="#7cb3fc")+
+  geom_point(data = labelGenes_sg, shape = 1, size = 2)+
+  geom_vline(linetype = "dashed", xintercept = logFC_threshold)+
+  geom_vline(linetype = "dashed", xintercept = -logFC_threshold)+
+  geom_hline(linetype = "dashed", yintercept = logFC_threshold)+
+  geom_hline(linetype = "dashed", yintercept = -logFC_threshold)+
+  # xlim(c(-maxFC, maxFC))+
+  geom_text_repel(data = labelGenes_sg,
+                   aes(label = gene_symbol),
+                   size = 2,
+                   # force_pull = 2,
+                   force = 25,
+                   position = position_nudge_center(x = 4, center_x = -0.85, y = 4, center_y = 0),
+                   min.segment.length = 0,
+                  segment.size = 0.25,
+                   max.iter = 1000,
+                   max.overlaps = 20,
+                  box.padding = 0.2)+
+  ggtitle("Differential Expression - ARSENITE / DMSO")+
+  labs(x="LogFC Proteome (ARS-DMSO)", y="LogFC Polysome (ARS-DMSO)")+
+  theme_minimal()
+ggsave(paste0(absPath_wd,"plots/arsDmsoStressGranules_Scatterplot.jpg"),contrast_scatterplot)
+
+contrast_scatterplot <- ggplot(arsDmso_downregulated, aes(x = comboarsproteome_logFC, y = comboarspolysome_TPMlogFC))+
+  geom_point(color="gray")+
+  geom_point(data=labelGenes_sg %>%
+               filter(gene_symbol %in% comboArs_signif_up$gene_symbol),
+             color="#ff7070")+
+  geom_point(data=comboArs_signif_down %>%
+               filter(gene_symbol %in% comboArs_signif_down$gene_symbol),
+             color="#7cb3fc")+
+  geom_point(data = labelGenes_sg, shape = 1, size = 2)+
+  geom_vline(linetype = "dashed", xintercept = -logFC_threshold)+
+  geom_vline(linetype = "dashed", xintercept = logFC_threshold)+
+  geom_hline(linetype = "dashed", yintercept = -logFC_threshold)+
+  geom_hline(linetype = "dashed", yintercept = logFC_threshold)+
+  # xlim(c(-maxFC, maxFC))+
+  geom_text_repel(data = labelGenes_sg,
+                   aes(label = gene_symbol),
+                   size = 2,
+                   force_pull = 2,
+                   force = 20,
+                   position = position_nudge_center(x = 1, center_x = 1.2, y = 1, center_y = 1.2),
+                   min.segment.length = 0,
+                  segment.size = 0.25,
+                   max.iter = 1000,
+                   max.overlaps = 20,
+                  box.padding = 0.2)+
+  ggtitle("Differential Expression - COMBO / ARSENITE")+
+  labs(x="LogFC Proteome (COMBO-ARS)", y="LogFC Polysome (COMBO-ARS)")+
+  theme_minimal()
+
+ggsave(paste0(absPath_wd,"plots/comboArsStressGranules_Scatterplot.jpg"),contrast_scatterplot)
+
+contrast_scatterplot <- ggplot(arsDmso_downregulated, aes(x = comboarsRip_TPMlogFC, y = arsdmsoRip_TPMlogFC))+
+  geom_point(color="gray")+
+  geom_point(data=labelGenes_sg %>%
+               filter(gene_symbol %in% Rip_signif_up$gene_symbol),
+             color="#ff7070")+
+  geom_point(data=comboArs_signif_down %>%
+               filter(gene_symbol %in% Rip_signif_down$gene_symbol),
+             color="#7cb3fc")+
+  geom_point(data = labelGenes_sg, shape = 1, size = 2)+
+  geom_vline(linetype = "dashed", xintercept = -logFC_threshold)+
+  geom_vline(linetype = "dashed", xintercept = logFC_threshold)+
+  geom_hline(linetype = "dashed", yintercept = -logFC_threshold)+
+  geom_hline(linetype = "dashed", yintercept = logFC_threshold)+
+  # xlim(c(-maxFC, maxFC))+
+  geom_text_repel(data = labelGenes_sg,
+                   aes(label = gene_symbol),
+                   size = 2,
+                   force_pull = 2,
+                   force = 20,
+                   position = position_nudge_center(x = 0.7, center_x = 1, y = 2, center_y = 0),
+                   min.segment.length = 0,
+                  segment.size = 0.25,
+                   max.iter = 1000,
+                   max.overlaps = 20,
+                  box.padding = 0.2)+
+  ggtitle("YB-1 RNA-Immunoprecipitation")+
+  labs(x="LogFC YB-1 RNA-IP (COMBO-ARS)", y="LogFC YB-1 RNA-IP (ARS-DMSO)")+
+  theme_minimal()
+
+ggsave(paste0(absPath_wd,"plots/twoWayStressGranulesRip_Scatterplot.jpg"),contrast_scatterplot)
+
+
+```
+```{r hallmark analysis QC}
+yb1A673p1Hibit_pathwayData <- yb1A673p1Hibit_dataMatrix %>%
+  na.omit() %>%
+  mutate(rankScoring = arsdmsoproteome_logFC * -log10(yb1A673p1Hibit_pathwayData$arsdmsoproteome_adjpVal)) %>%
+  arrange(desc(rankScoring))
+
+pathwayVector <- yb1A673p1Hibit_pathwayData$rankScoring
+names(pathwayVector) <- yb1A673p1Hibit_pathwayData$gene_symbol
+
+hallmarkGeneSet <- fgsea::gmtPathways(paste0(absPath_wd,"/dataFiles/h.all.v2024.1.Hs.symbols.gmt"))
+hallmarkRes <- fgsea::fgsea(hallmarkGeneSet, pathwayVector, nproc = 1)
+fgsea::plotEnrichment(hallmarkGeneSet$HALLMARK_APOPTOSIS, pathwayVector)
+data.frame(hallmarkRes$pathway, hallmarkRes$padj) %>%
+  arrange(hallmarkRes.padj)
+
+```
+
+```{r negRIP differential expression}
+
+logFC_threshold <- log2(2)
+
+### Instead of a YBX1 up and YBX1 down approach, perhaps we can use negative controls to identiy YBX1 targets.
+geneRIP_data <- aggData_processed %>%
+  merge(genes, all.y = TRUE, by.x = "Name", by.y = "ensembl_transcript_id_version") %>% 
+  dplyr::select("Name" = external_gene_name,contains("neg",ignore.case = TRUE), contains("Rip")) %>%
+  dplyr::select(Name, contains("TPM")) %>%
+  group_by(Name) %>%
+  summarize(across(everything(), function(x) sum(x, na.rm = TRUE))) %>%
+  na.omit()
+sampleLabels <- c("negInput","negRIP",str_match(colnames(geneRIP_data)[4:ncol(geneRIP_data)],"TPM_(.*)(Rip).")[,2])
+
+designMat <- model.matrix(~0+sampleLabels,
+                            data=geneRIP_data[,2:ncol(geneRIP_data)])
+colnames(designMat) = gsub('sampleLabels','',colnames(designMat))
+
+limmaDataMat <- geneRIP_data %>%
+  column_to_rownames("Name") %>%
+  apply(2,function(x){log2(x+0.01)}) %>%
+  as.data.frame()
+negRip_fit = lmFit(limmaDataMat, design = designMat)
+
+contrasts <- apply(combn(rev(unique(sampleLabels)), 2), 2, function(x) paste0(x[1],"-",x[2]))
+contrasts <- contrasts[grepl("neg(Input|RIP)$",contrasts)]
+
+contrast.matrix = makeContrasts(contrasts = contrasts, levels=designMat)
+negRip_fit = contrasts.fit(negRip_fit, contrast.matrix)
+negRip_fit = eBayes(negRip_fit)
+
+
+for (condition in c("dmso","ars","ms275","combo")){
+  loopTable_1 <- topTable(negRip_fit, coef = paste0(condition,"-negRIP"), number = nrow(geneRIP_data)) %>%
+    filter(logFC>logFC_threshold, adj.P.Val <= 0.05) %>%
+    dplyr::select("negRIP_logFC"=logFC, "negRIP_adjPVal"=adj.P.Val)
+  loopTable_2 <- topTable(negRip_fit, coef = paste0(condition,"-negInput"), number = nrow(geneRIP_data)) %>%
+    filter(logFC>logFC_threshold, adj.P.Val <= 0.05) %>%
+    dplyr::select("negInput_logFC"=logFC, "negInput_adjPVal"=adj.P.Val)
+  loopTable_out <- merge(loopTable_1, loopTable_2, by = "row.names") %>%
+    dplyr::rename("gene_symbol"=Row.names)
+  assign(paste0(condition,"_Yb1RipTargets"), loopTable_out)
+}
+
+anyCond_Yb1RipTargets <- unique(c(ars_Yb1RipTargets$gene_symbol,
+                                  dmso_Yb1RipTargets$gene_symbol,
+                                  combo_Yb1RipTargets$gene_symbol,
+                                  ms275_Yb1RipTargets$gene_symbol))
+
+# data.frame(condition = c("dmso", "ms275", "arsenite", "combo", "anyCondition"),
+#            rnaIpTargets = c(paste(dmso_Yb1RipTargets$uniprotswissprot, collapse = ","),
+#                             paste(ms275_Yb1RipTargets$uniprotswissprot, collapse = ","),
+#                             paste(ars_Yb1RipTargets$uniprotswissprot, collapse = ","),
+#                             paste(combo_Yb1RipTargets$uniprotswissprot, collapse = ","),
+#                             paste(anyCond_Yb1RipTargets, collapse = ","))) %>%
+#   write_lines(paste0(absPath_wd, "dataFiles/yb1_rnaIPTargets_uniprot.txt"))
+
+```
+
+```{r gene ontology analysis Polysome Binding - cellular component}
+logFC_threshold <- log2(2.5)
+
+## Upregulated GO Analysis (CC) - Only focus on transcripts bound by polysomes (i.e. proteins undergoing active translation)
+geneList_arsdmsoUp <- yb1A673p1Hibit_dataMatrix %>%
+  filter(arsdmsopolysome_TPMadjpVal <= 0.05,
+         arsdmsopolysome_TPMlogFC > logFC_threshold) %>%
+  pull(gene_symbol)
+# Convert gene symbols to Entrez IDs
+geneEntrez_arsdmsoUp <- bitr(geneList_arsdmsoUp, fromType = "SYMBOL", 
+                    toType = "ENTREZID", 
+                    OrgDb = org.Hs.eg.db)
+# Perform GO enrichment analysis for the Cellular Component (CC) category
+goEnrichment_arsdmsoUp_cc <- enrichGO(gene         = geneEntrez_arsdmsoUp$ENTREZID,
+                         OrgDb        = org.Hs.eg.db,
+                         ont          = "CC",      # Cellular compartment ontology
+                         pAdjustMethod = "BH",     # Benjamini-Hochberg correction
+                         pvalueCutoff  = 0.05,     # Adjust this based on your analysis
+                         qvalueCutoff  = 0.05)
+## Downregulated GO Analysis (CC) - Only focus on transcripts bound by polysomes (i.e. proteins undergoing active translation)
+geneList_arsdmsoDown <- yb1A673p1Hibit_dataMatrix %>%
+  filter(arsdmsopolysome_TPMadjpVal <= 0.05,
+         arsdmsopolysome_TPMlogFC < -logFC_threshold,
+         gene_symbol %in% anyCond_Yb1RipTargets) %>%
+  pull(gene_symbol)
+# Convert gene symbols to Entrez IDs
+geneEntrez_arsdmsoDown <- bitr(geneList_arsdmsoDown, fromType = "SYMBOL", 
+                    toType = "ENTREZID", 
+                    OrgDb = org.Hs.eg.db)
+# Perform GO enrichment analysis for the Cellular Component (CC) category
+goEnrichment_arsdmsoDown_cc <- enrichGO(gene         = geneEntrez_arsdmsoDown$ENTREZID,
+                         OrgDb        = org.Hs.eg.db,
+                         ont          = "CC",      # Cellular compartment ontology
+                         pAdjustMethod = "BH",     # Benjamini-Hochberg correction
+                         pvalueCutoff  = 0.05,     # Adjust this based on your analysis
+                         qvalueCutoff  = 0.05)
+goEnrichment_arsdmsoUp_cc.res <- goEnrichment_arsdmsoUp_cc@result
+goEnrichment_arsdmsoUp_cc.res["direction"] <- "Increase"
+goEnrichment_arsdmsoDown_cc.res <- goEnrichment_arsdmsoDown_cc@result
+goEnrichment_arsdmsoDown_cc.res["direction"] <- "Decrease"
+goEnrichment_arsdmso_cc <- rbind(goEnrichment_arsdmsoUp_cc.res, goEnrichment_arsdmsoDown_cc.res)
+
+# View the top results
+go_labels <- goEnrichment_arsdmso_cc %>% group_by(direction) %>%
+  dplyr::arrange(p.adjust) %>%
+  dplyr::slice(1:10) %>% pull(ID) %>% unique()
+
+goEnrichment_data <- goEnrichment_arsdmso_cc %>% 
+  filter(ID %in% go_labels) %>%
+  dplyr::select(Description, FoldEnrichment, p.adjust, Count, direction)
+goEnrichment_factor <- goEnrichment_data %>%
+  mutate(value = ifelse(direction == "Decrease", -FoldEnrichment, FoldEnrichment)) %>%
+  arrange(desc(value)) %>% pull(Description) %>% unique()
+goEnrichment_significant <- goEnrichment_data %>%
+  filter(p.adjust <= 0.05)
+
+goOntology_cc <- goEnrichment_data %>%
+  ggplot(aes(x = direction, y = factor(Description, levels = goEnrichment_factor)))+
+  geom_tile(aes(fill = p.adjust), color = "black", linewidth = 0.8)+
+  scale_fill_gradientn(colors = c("black", "white","white", "white"),
+    values = c(0, 0.05, 0.051, 1),
+    limits = c(0, 1))+
+  geom_point(aes(size = FoldEnrichment, color = FoldEnrichment))+
+  scale_color_gradientn(colours = c("#245EDB", "#ffffff","#DBA124","#DBA124"),
+    values = c(0, 0.1, 0.5, 1),
+    limits = c(0, 10))+
+  scale_size_continuous(range = c(1, 10)) +
+  geom_point(data = goEnrichment_significant, aes(size = FoldEnrichment), shape = 1, color = "white", stroke = 1.3)+
+  theme_minimal()+
+  labs(x = "Change in mRNA binding to Polysomes", y = "GO Term (Cellular Component)")
+
+# ggsave(paste0(absPath_wd,"plots/goRepresentationPlot_PolyBindingcc.jpg"), goOntology_cc)
+
+```
+
+```{r gene ontology analysis Polysome Binding - biological process}
+
+# Perform GO enrichment analysis for the Biological Process (BP) category
+goEnrichment_arsdmsoUp_bp <- enrichGO(gene         = geneEntrez_arsdmsoUp$ENTREZID,
+                         OrgDb        = org.Hs.eg.db,
+                         ont          = "BP",      # Biological Processes ontology
+                         pAdjustMethod = "BH",     # Benjamini-Hochberg correction
+                         pvalueCutoff  = 0.05,     # Adjust this based on your analysis
+                         qvalueCutoff  = 0.05)
+
+# Perform GO enrichment analysis for the Biological Process (BP) category
+goEnrichment_arsdmsoDown_bp <- enrichGO(gene         = geneEntrez_arsdmsoDown$ENTREZID,
+                         OrgDb        = org.Hs.eg.db,
+                         ont          = "BP",      # Biological Processes ontology
+                         pAdjustMethod = "BH",     # Benjamini-Hochberg correction
+                         pvalueCutoff  = 0.05,     # Adjust this based on your analysis
+                         qvalueCutoff  = 0.05)
+goEnrichment_arsdmsoUp_bp.res <- goEnrichment_arsdmsoUp_bp@result
+goEnrichment_arsdmsoUp_bp.res["direction"] <- "Increase"
+goEnrichment_arsdmsoDown_bp.res <- goEnrichment_arsdmsoDown_bp@result
+goEnrichment_arsdmsoDown_bp.res["direction"] <- "Decrease"
+goEnrichment_arsdmso_bp <- rbind(goEnrichment_arsdmsoUp_bp.res, goEnrichment_arsdmsoDown_bp.res)
+
+# View the top results
+go_labels <- goEnrichment_arsdmso_bp %>% group_by(direction) %>%
+  dplyr::arrange(p.adjust) %>%
+  dplyr::slice(1:10) %>% pull(ID) %>% unique()
+
+goEnrichment_data <- goEnrichment_arsdmso_bp %>% 
+  filter(ID %in% go_labels) %>%
+  dplyr::select(Description, FoldEnrichment, p.adjust, Count, direction)
+goEnrichment_factor <- goEnrichment_data %>%
+  mutate(value = ifelse(direction == "Decrease", -FoldEnrichment, FoldEnrichment)) %>%
+  arrange(desc(value)) %>% pull(Description) %>% unique()
+goEnrichment_significant <- goEnrichment_data %>%
+  filter(p.adjust <= 0.05)
+
+goOntology_bp <- goEnrichment_data %>%
+  ggplot(aes(x = direction, y = factor(Description, levels = goEnrichment_factor)))+
+  geom_tile(aes(fill = p.adjust), color = "black", linewidth = 0.8)+
+  scale_fill_gradientn(colors = c("black", "grey","white", "white"),
+    values = c(0, 0.05, 0.051, 1),
+    limits = c(0, 1))+
+  geom_point(aes(size = FoldEnrichment, color = FoldEnrichment))+
+  scale_color_gradientn(colours = c("#245EDB", "#ffffff","#DBA124","#DBA124"),
+    values = c(0, 0.1, 0.5, 1),
+    limits = c(0, 10))+
+  scale_size_continuous(range = c(1, 10)) +
+  geom_point(data = goEnrichment_significant, aes(size = FoldEnrichment), shape = 1, color = "white", stroke = 1.3)+
+  theme_minimal()+
+  labs(x = "Change in mRNA binding to Polysomes", y = "GO Term (Biological Process)")
+
+# ggsave(paste0(absPath_wd,"plots/goRepresentationPlot_PolyBindingbp.jpg"), goOntology_bp)
+
+
+```
+
+```{r gene ontology analysis RNA IP - cellular component}
+logFC_threshold <-  log2(1.5)
+## Upregulated GO Analysis (CC) - Only focus on transcripts bound by polysomes (i.e. proteins undergoing active translation)
+geneList_arsdmsoUp <- yb1A673p1Hibit_dataMatrix %>%
+  filter(arsdmsoRip_TPMadjpVal <= 0.05,
+         arsdmsoRip_TPMlogFC >= logFC_threshold) %>%
+  pull(gene_symbol)
+# Convert gene symbols to Entrez IDs
+geneEntrez_arsdmsoUp <- bitr(geneList_arsdmsoUp, fromType = "SYMBOL", 
+                    toType = "ENTREZID", 
+                    OrgDb = org.Hs.eg.db)
+# Perform GO enrichment analysis for the Cellular Component (CC) category
+goEnrichment_arsdmsoUp_cc <- enrichGO(gene         = geneEntrez_arsdmsoUp$ENTREZID,
+                         OrgDb        = org.Hs.eg.db,
+                         ont          = "BP",      # Cellular compartment ontology
+                         pAdjustMethod = "BH",     # Benjamini-Hochberg correction
+                         pvalueCutoff  = 0.05,     # Adjust this based on your analysis
+                         qvalueCutoff  = 0.05)
+## Downregulated GO Analysis (CC) - Only focus on transcripts bound by polysomes (i.e. proteins undergoing active translation)
+geneList_arsdmsoDown <- yb1A673p1Hibit_dataMatrix %>%
+  filter(arsdmsoRip_TPMadjpVal <= 0.05,
+         arsdmsoRip_TPMlogFC <= -logFC_threshold) %>%
+  pull(gene_symbol)
+# Convert gene symbols to Entrez IDs
+geneEntrez_arsdmsoDown <- bitr(geneList_arsdmsoDown, fromType = "SYMBOL", 
+                    toType = "ENTREZID", 
+                    OrgDb = org.Hs.eg.db)
+# Perform GO enrichment analysis for the Cellular Component (CC) category
+goEnrichment_arsdmsoDown_cc <- enrichGO(gene         = geneEntrez_arsdmsoDown$ENTREZID,
+                         OrgDb        = org.Hs.eg.db,
+                         ont          = "BP",      # Cellular compartment ontology
+                         pAdjustMethod = "BH",     # Benjamini-Hochberg correction
+                         pvalueCutoff  = 0.05,     # Adjust this based on your analysis
+                         qvalueCutoff  = 0.05)
+goEnrichment_arsdmsoUp_cc.res <- goEnrichment_arsdmsoUp_cc@result
+goEnrichment_arsdmsoUp_cc.res["direction"] <- "Increase"
+goEnrichment_arsdmsoDown_cc.res <- goEnrichment_arsdmsoDown_cc@result
+goEnrichment_arsdmsoDown_cc.res["direction"] <- "Decrease"
+goEnrichment_arsdmso_cc <- rbind(goEnrichment_arsdmsoUp_cc.res, goEnrichment_arsdmsoDown_cc.res)
+
+# View the top results
+go_labels <- goEnrichment_arsdmso_cc %>% group_by(direction) %>%
+  dplyr::arrange(p.adjust) %>%
+  dplyr::slice(1:10) %>% pull(ID) %>% unique()
+
+goEnrichment_data <- goEnrichment_arsdmso_cc %>% 
+  filter(ID %in% go_labels) %>%
+  dplyr::select(Description, FoldEnrichment, p.adjust, Count, direction)
+goEnrichment_factor <- goEnrichment_data %>%
+  mutate(value = ifelse(direction == "Decrease", -FoldEnrichment, FoldEnrichment)) %>%
+  arrange(desc(value)) %>% pull(Description) %>% unique()
+goEnrichment_significant <- goEnrichment_data %>%
+  filter(p.adjust <= 0.05)
+
+goOntology_cc <- goEnrichment_data %>%
+  ggplot(aes(x = direction, y = factor(Description, levels = goEnrichment_factor)))+
+  geom_tile(aes(fill = p.adjust), color = "black", linewidth = 0.8)+
+  scale_fill_gradientn(colors = c("black", "white","white", "white"),
+    values = c(0, 0.05, 0.051, 1),
+    limits = c(0, 1))+
+  geom_point(aes(size = FoldEnrichment, color = FoldEnrichment))+
+  scale_color_gradientn(colours = c("#245EDB", "#ffffff","#DBA124","#DBA124"),
+    values = c(0, 0.1, 0.5, 1),
+    limits = c(0, 10))+
+  scale_size_continuous(range = c(1, 10)) +
+  geom_point(data = goEnrichment_significant, aes(size = FoldEnrichment), shape = 1, color = "white", stroke = 1.3)+
+  theme_minimal()+
+  labs(x = "Change in mRNA binding to YB-1", y = "GO Term (Cellular Component)")
+
+# ggsave(paste0(absPath_wd,"plots/goRepresentationPlot_Yb1Bindingcc.jpg"), goOntology_cc)
+
+goEnrichment_arsdmsoDown_cc@result %>% filter(grepl("mitochond", Description, ignore.case = T))
+```
+
+```{r gene ontology analysis RNA IP - biological process}
+
+# Perform GO enrichment analysis for the Biological Process (BP) category
+goEnrichment_arsdmsoUp_bp <- enrichGO(gene         = geneEntrez_arsdmsoUp$ENTREZID,
+                         OrgDb        = org.Hs.eg.db,
+                         ont          = "BP",      # Biological Processes ontology
+                         pAdjustMethod = "BH",     # Benjamini-Hochberg correction
+                         pvalueCutoff  = 0.05,     # Adjust this based on your analysis
+                         qvalueCutoff  = 0.05)
+
+# Perform GO enrichment analysis for the Biological Process (BP) category
+goEnrichment_arsdmsoDown_bp <- enrichGO(gene         = geneEntrez_arsdmsoDown$ENTREZID,
+                         OrgDb        = org.Hs.eg.db,
+                         ont          = "BP",      # Biological Processes ontology
+                         pAdjustMethod = "BH",     # Benjamini-Hochberg correction
+                         pvalueCutoff  = 0.05,     # Adjust this based on your analysis
+                         qvalueCutoff  = 0.05)
+goEnrichment_arsdmsoUp_bp.res <- goEnrichment_arsdmsoUp_bp@result
+goEnrichment_arsdmsoUp_bp.res["direction"] <- "Increase"
+goEnrichment_arsdmsoDown_bp.res <- goEnrichment_arsdmsoDown_bp@result
+goEnrichment_arsdmsoDown_bp.res["direction"] <- "Decrease"
+goEnrichment_arsdmso_bp <- rbind(goEnrichment_arsdmsoUp_bp.res, goEnrichment_arsdmsoDown_bp.res)
+
+# View the top results
+go_labels <- goEnrichment_arsdmso_bp %>% group_by(direction) %>%
+  dplyr::arrange(p.adjust) %>%
+  dplyr::slice(1:10) %>% pull(ID) %>% unique()
+
+goEnrichment_data <- goEnrichment_arsdmso_bp %>% 
+  filter(ID %in% go_labels) %>%
+  dplyr::select(Description, FoldEnrichment, p.adjust, Count, direction)
+goEnrichment_factor <- goEnrichment_data %>%
+  mutate(value = ifelse(direction == "Decrease", -FoldEnrichment, FoldEnrichment)) %>%
+  arrange(desc(value)) %>% pull(Description) %>% unique()
+goEnrichment_significant <- goEnrichment_data %>%
+  filter(p.adjust <= 0.05)
+
+goOntology_bp <- goEnrichment_data %>%
+  ggplot(aes(x = direction, y = factor(Description, levels = goEnrichment_factor)))+
+  geom_tile(aes(fill = p.adjust), color = "black", linewidth = 0.8)+
+  scale_fill_gradientn(colors = c("black", "grey","white", "white"),
+    values = c(0, 0.05, 0.051, 1),
+    limits = c(0, 1))+
+  geom_point(aes(size = FoldEnrichment, color = FoldEnrichment))+
+  scale_color_gradientn(colours = c("#245EDB", "#ffffff","#DBA124","#DBA124"),
+    values = c(0, 0.1, 0.5, 1),
+    limits = c(0, 10))+
+  scale_size_continuous(range = c(1, 10)) +
+  geom_point(data = goEnrichment_significant, aes(size = FoldEnrichment), shape = 1, color = "white", stroke = 1.3)+
+  theme_minimal()+
+  labs(x = "Change in mRNA binding to YB-1", y = "GO Term (Biological Process)")
+
+# ggsave(paste0(absPath_wd,"plots/goRepresentationPlot_Yb1Bindingbp.jpg"), goOntology_bp)
+
+
+```
+
+```{r gene ontology analysis YB1 Interactors - cellular component}
+
+interactomeData <- yb1A673p1Hibit_dataMatrix[,grepl("arsdmso.*Ybx1Int",colnames(yb1A673p1Hibit_dataMatrix))]
+interactomeData <- cbind(yb1A673p1Hibit_dataMatrix[,c(1,2)], interactomeData) %>%
+  na.omit()
+arsdmsoInt_signif <- interactomeData %>% filter(arsdmsoYbx1Int_adjpVal <= 0.05,
+                                            abs(arsdmsoYbx1Int_logFC)>log2(2))
+arsdmsoInt_signif_up <- arsdmsoInt_signif %>% filter(arsdmsoYbx1Int_logFC>0)
+arsdmsoInt_signif_down <- arsdmsoInt_signif %>% filter(arsdmsoYbx1Int_logFC<0)
+labelGenes <- arsdmsoInt_signif %>% arrange(arsdmsoYbx1Int_logFC) %>%
+  dplyr::slice(1:50,(nrow(arsdmsoInt_signif)-49):nrow(arsdmsoInt_signif))
+
+contrast_scatterplot <- ggplot(interactomeData, aes(x = arsdmsoYbx1Int_logFC, y = -log10(arsdmsoYbx1Int_adjpVal)))+
+  geom_point(color="gray")+
+  geom_point(data=arsdmsoInt_signif_up,color="#ff7070")+
+  geom_point(data=arsdmsoInt_signif_down,color="#7cb3fc")+
+  geom_point(data = labelGenes, shape = 1, size = 2)+
+  geom_vline(linetype = "dashed", xintercept = logFC_threshold)+
+  geom_vline(linetype = "dashed", xintercept = -logFC_threshold)+
+  geom_hline(linetype = "dashed", yintercept = -log10(0.05))+
+  # xlim(c(-maxFC, maxFC))+
+  geom_text_repel(data = labelGenes,
+                   aes(label = gene_symbol),
+                   size = 2,
+                   force_pull = 2,
+                   force = 20,
+                   position = position_nudge_center(x = 1.5, center_x = 0.2, y = 2, center_y = 1),
+                   min.segment.length = 0,
+                  segment.size = 0.25,
+                   max.iter = 1000,
+                   max.overlaps = 20,
+                  box.padding = 0.2)+
+  ggtitle("Differential Expression - ARSENITE / DMSO")+
+  labs(x="LogFC Proteome (ARS-DMSO)", y="LogFC Polysome (ARS-DMSO)")+
+  theme_minimal()
+
+## Upregulated GO Analysis (CC)
+geneList_arsdmsoUp <- arsdmsoInt_signif_up %>%
+  pull(gene_symbol)
+# Convert gene symbols to Entrez IDs
+geneEntrez_arsdmsoUp <- bitr(geneList_arsdmsoUp, fromType = "SYMBOL", 
+                    toType = "ENTREZID", 
+                    OrgDb = org.Hs.eg.db)
+
+# Perform GO enrichment analysis for the Cellular Component (CC) category
+goEnrichment_arsdmsoUp_cc <- enrichGO(gene         = geneEntrez_arsdmsoUp$ENTREZID,
+                         OrgDb        = org.Hs.eg.db,
+                         ont          = "CC",      # Cellular compartment ontology
+                         pAdjustMethod = "BH",     # Benjamini-Hochberg correction
+                         pvalueCutoff  = 0.05,     # Adjust this based on your analysis
+                         qvalueCutoff  = 0.05, minGSSize = 10)
+## Downregulated GO Analysis (CC)
+geneList_arsdmsoDown <- arsdmsoInt_signif_down %>%
+  pull(gene_symbol)
+# Convert gene symbols to Entrez IDs
+geneEntrez_arsdmsoDown <- bitr(geneList_arsdmsoDown, fromType = "SYMBOL", 
+                    toType = "ENTREZID", 
+                    OrgDb = org.Hs.eg.db)
+# Perform GO enrichment analysis for the Cellular Component (CC) category
+goEnrichment_arsdmsoDown_cc <- enrichGO(gene         = geneEntrez_arsdmsoDown$ENTREZID,
+                         OrgDb        = org.Hs.eg.db,
+                         ont          = "CC",      # Biological Processes ontology
+                         pAdjustMethod = "BH",     # Benjamini-Hochberg correction
+                         pvalueCutoff  = 0.05,     # Adjust this based on your analysis
+                         qvalueCutoff  = 0.05, minGSSize = 10)
+goEnrichment_arsdmsoUp_cc.res <- goEnrichment_arsdmsoUp_cc@result
+goEnrichment_arsdmsoUp_cc.res["direction"] <- "up"
+goEnrichment_arsdmsoDown_cc.res <- goEnrichment_arsdmsoDown_cc@result
+goEnrichment_arsdmsoDown_cc.res["direction"] <- "down"
+goEnrichment_arsdmso_cc <- rbind(goEnrichment_arsdmsoUp_cc.res, goEnrichment_arsdmsoDown_cc.res)
+
+# View the top results
+go_labels <- goEnrichment_arsdmso_cc %>% group_by(direction) %>%
+  dplyr::arrange(p.adjust) %>%
+  dplyr::slice(1:15) %>% pull(ID) %>% unique()
+
+goEnrichment_data <- goEnrichment_arsdmso_cc %>% 
+  filter(ID %in% go_labels) %>%
+  dplyr::select(Description, FoldEnrichment, p.adjust, Count, direction)
+goEnrichment_factor <- goEnrichment_data %>%
+  mutate(value = ifelse(direction == "down", -FoldEnrichment, FoldEnrichment)) %>%
+  arrange(desc(value)) %>% pull(Description) %>% unique()
+goEnrichment_significant <- goEnrichment_data %>%
+  filter(p.adjust <= 0.05)
+
+goOntology_cc <- goEnrichment_data %>%
+  ggplot(aes(x = direction, y = factor(Description, levels = goEnrichment_factor)))+
+  geom_tile(aes(fill = p.adjust), color = "black", linewidth = 0.8)+
+  scale_fill_gradientn(colors = c("black", "grey","white", "white"),
+    values = c(0, 0.05, 0.051, 1),
+    limits = c(0, 1))+
+  geom_point(aes(size = FoldEnrichment, color = FoldEnrichment))+
+  scale_color_gradientn(colours = c("#245EDB", "#ffffff","#DBA124","red"),
+    values = c(0, 0.025, 0.125, 1),
+    limits = c(0, 110))+
+  scale_size_continuous(range = c(1, 10)) +
+  geom_point(data = goEnrichment_significant, aes(size = FoldEnrichment), shape = 1, color = "white", stroke = 1.3)+
+  theme_minimal()
+
+ggsave(paste0(absPath_wd,"plots/goRepresentationPlot_InteractorsCC.jpg"), goOntology_cc)
+
+
+```
+
+Analyzing mitochondrial gene expression
+
+```{r loading mitochondrial resources}
+
+mitocarta_data <- read_excel(paste0(absPath_wd, "/dataFiles/Human.MitoCarta3.0.xls"), sheet = 2)
+
+### Let's first explore expression of MT-encoded genes (13)
+mtEncodedGenes <- mitocarta_data %>% filter(grepl("^MT-", Symbol)) %>% pull(Symbol)
+plotMitoSubset <- yb1A673p1Hibit_dataMatrix %>% filter(gene_symbol %in% mtEncodedGenes)
+ggplot(plotMitoSubset, aes(x = arsdmsoRip_TPMlogFC, y = arsdmsopolysome_TPMlogFC))+
+  geom_point()
+
+```
+
+```{r mitochondrial pathway analysis}
+gseaMito.geneRanks <- yb1A673p1Hibit_dataMatrix %>%
+  mutate(rank = -log10(arsdmsopolysome_TPMadjpVal) * arsdmsopolysome_TPMlogFC) %>%
+  arrange(desc(rank))
+gseaMito.geneList <- gseaMito.geneRanks$rank
+names(gseaMito.geneList) <- gseaMito.geneRanks$gene_symbol
+
+mitocarta_data.pathways <- read_excel(paste0(absPath_wd, "/dataFiles/Human.MitoCarta3.0.xls"), sheet = 4) %>%
+  na.omit()
+gseaMito.pathways <- list()
+gseaMito.pathList <- unique(str_match(mitocarta_data.pathways$`MitoPathways Hierarchy`, "^(.*) > (.*) > (.*)")[,3]) %>% na.omit()
+for (pathway in gseaMito.pathList){
+  loopList <- mitocarta_data.pathways %>% filter(MitoPathway == pathway) %>% pull(Genes)
+  gseaMito.pathways[pathway] <- str_split(loopList,", ")
+}
+
+### Let's carry out enrichment analysis on polysome targets
+gseaMito.res <- fgsea::fgsea(pathways = gseaMito.pathways, stats = gseaMito.geneList)
+gseaMito.pathSignif <- gseaMito.res %>%
+  # filter(padj <= 0.05) %>%
+  arrange(padj*NES) %>%
+  pull(pathway)
+gseaMito.significantPathNames <- gseaMito.res %>%
+  filter(padj <= 0.05) %>%
+  pull(pathway)
+
+gseaMito.dataSet <- yb1A673p1Hibit_dataMatrix
+gseaMito.dataSet["Mitochondrial Gene Set"] <- "All protein-coding genes"
+for (pathway in gseaMito.pathSignif){
+  loopGenes <- gseaMito.pathways[pathway] %>% unlist(use.names = F)
+  loopSubset <- yb1A673p1Hibit_dataMatrix %>% filter(gene_symbol %in% loopGenes)
+  loopSubset["Mitochondrial Gene Set"] <- pathway
+  gseaMito.dataSet <- rbind(gseaMito.dataSet, loopSubset)
+  # assign(paste0("gseaMitoPlots.", pathway), loopGraph)
+}
+gseaMito.dataSet <- gseaMito.dataSet %>%
+  mutate(`Mitochondrial Gene Set` = factor(`Mitochondrial Gene Set`, 
+                                           levels = c("All protein-coding genes", gseaMito.pathSignif)))
+
+```
+
+```{r mitochondrial expression summary plots}
+
+ggplot(gseaMito.dataSet %>% filter(gene_symbol %in% anyCond_Yb1RipTargets), aes(x = factor(`Mitochondrial Gene Set`, levels = c("All protein-coding genes",gseaMito.pathSignif)),
+                             y = arsdmsopolysome_TPMlogFC,
+                             fill = `Mitochondrial Gene Set` %in% gseaMito.significantPathNames))+
+  geom_jitter(alpha = 0.1, color = "black",width = 0.2)+
+  geom_hline(yintercept = 0, size  = 0.8, linetype = "dashed", color = "gray")+
+  geom_boxplot(outlier.shape = NA)+
+  scale_fill_brewer(palette = "Set3")+
+  # ylim(c(-2,2))+
+  labs(fill = "Is significant", x = "Gene set name", y = "Polysome logFC(Ars-DMSO)")+
+  coord_flip()+
+  theme_minimal()
+
+ggsave(paste0(absPath_wd, "plots/mitoGeneSet_arsdmso_yb1BoundPolysome_boxplot_updated.jpg"))
+
+ggplot(gseaMito.dataSet %>% filter(gene_symbol %in% anyCond_Yb1RipTargets), aes(x = factor(`Mitochondrial Gene Set`, levels = c("All protein-coding genes",gseaMito.pathSignif)),
+                             y = arsdmsoproteome_logFC,
+                             fill = `Mitochondrial Gene Set` %in% gseaMito.significantPathNames))+
+  geom_jitter(alpha = 0.1, color = "black",width = 0.2)+
+  geom_hline(yintercept = 0, size  = 0.8, linetype = "dashed", color = "gray")+
+  geom_boxplot(outlier.shape = NA)+
+  scale_fill_brewer(palette = "Set3")+
+  ylim(c(-.5,.5))+
+  labs(fill = "Is significant", x = "Gene set name", y = "Proteome logFC(Ars-DMSO)")+
+  coord_flip()+
+  theme_minimal()
+
+ggsave(paste0(absPath_wd, "plots/mitoGeneSet_arsdmso_yb1BoundProteome_boxplot_updated.jpg"))
+
+ggplot(gseaMito.dataSet %>% filter(gene_symbol %in% anyCond_Yb1RipTargets), aes(x = factor(`Mitochondrial Gene Set`, levels = c("All protein-coding genes",gseaMito.pathSignif)),
+                             y = arsdmsoRip_TPMlogFC,
+                             fill = `Mitochondrial Gene Set` %in% gseaMito.significantPathNames))+
+  geom_jitter(alpha = 0.1, color = "black",width = 0.2)+
+  geom_hline(yintercept = 0, size  = 0.8, linetype = "dashed", color = "gray")+
+  geom_boxplot(outlier.shape = NA)+
+  scale_fill_brewer(palette = "Set3")+
+  # ylim(c(-2,2))+
+  labs(fill = "Is significant", x = "Gene set name", y = "YBX1 RNA-IP logFC(Ars-DMSO)")+
+  coord_flip()+
+  theme_minimal()
+
+ggsave(paste0(absPath_wd, "plots/mitoGeneSet_arsdmso_yb1BoundRip_boxplot_updated.jpg"))
+
+ggplot(gseaMito.dataSet %>% filter(gene_symbol %in% anyCond_Yb1RipTargets), aes(x = factor(`Mitochondrial Gene Set`, levels = c("All protein-coding genes",gseaMito.pathSignif)),
+                             y = arsdmsototalmRNA_TPMlogFC,
+                             fill = `Mitochondrial Gene Set` %in% gseaMito.significantPathNames))+
+  geom_jitter(alpha = 0.1, color = "black",width = 0.2)+
+  geom_hline(yintercept = 0, size  = 0.8, linetype = "dashed", color = "gray")+
+  geom_boxplot(outlier.shape = NA)+
+  scale_fill_brewer(palette = "Set3")+
+  # ylim(c(-2,2))+
+  labs(fill = "Is significant", x = "Gene set name", y = "YBX1 totalmRNA logFC(Ars-DMSO)")+
+  coord_flip()+
+  theme_minimal()
+
+ggsave(paste0(absPath_wd, "plots/mitoGeneSet_arsdmso_yb1BoundtotalmRNA_boxplot_updated.jpg"))
+
+mtEncoded_genes <- mitocarta_data[mitocarta_data$hg19_Chromosome=="chrM",] %>% pull(Symbol)
+yb1A673p1Hibit_dataMatrix %>%
+  mutate(chrM_encoded = gene_symbol %in% mtEncoded_genes) %>%
+  ggplot(aes(x = chrM_encoded, y = arsdmsopolysome_TPMlogFC, fill = chrM_encoded))+
+  geom_boxplot(outlier.shape = NA)+
+  lims(y = c(-3,3))+
+  labs(fill = "Is encoded by mtDNA", x = "Is encoded by mtDNA", y = "Polysome binding logFC(Ars-DMSO)")+
+  coord_flip()+
+  theme_minimal()
+ggsave(paste0(absPath_wd, "plots/mtEncoded_arsdmso_yb1Boundpolysome_boxplot_updated.jpg"),
+       width = 5, height = 1.5)
+
+yb1A673p1Hibit_dataMatrix %>%
+  mutate(chrM_encoded = gene_symbol %in% mtEncoded_genes) %>%
+  ggplot(aes(x = chrM_encoded, y = arsdmsoRip_TPMlogFC, fill = chrM_encoded))+
+  geom_boxplot(outlier.shape = NA)+
+  lims(y = c(-3,3))+
+  labs(fill = "Is encoded by mtDNA", x = "Is encoded by mtDNA", y = "YBX1 RNA-IP logFC(Ars-DMSO)")+
+  coord_flip()+
+  theme_minimal()
+ggsave(paste0(absPath_wd, "plots/mtEncoded_arsdmso_yb1BoundRip_boxplot_updated.jpg"),
+       width = 5, height = 1.5)
+
+yb1A673p1Hibit_dataMatrix %>%
+  mutate(chrM_encoded = gene_symbol %in% mtEncoded_genes) %>%
+  ggplot(aes(x = chrM_encoded, y = arsdmsototalmRNA_TPMlogFC, fill = chrM_encoded))+
+  geom_boxplot(outlier.shape = NA)+
+  lims(y = c(-3,3))+
+  labs(fill = "Is encoded by mtDNA", x = "Is encoded by mtDNA", y = "TotalmRNA logFC(Ars-DMSO)")+
+  coord_flip()+
+  theme_minimal()
+ggsave(paste0(absPath_wd, "plots/mtEncoded_arsdmso_yb1BoundtotalmRNA_boxplot_updated.jpg"),
+       width = 5, height = 1.5)
+
+```
+
+Another recurring pathway that shows up in the interactomics analysis is alternative splicing function (U2 spliceosome). Let's see if there are any prominent changes in YB-1 target mRNA isoforms (indicative of splicing dysregulation). 
+
+My hypothesis:
+YB1 (an RBP) forms a complex with spliceosome factors to deliver/target pre-mRNAs for splicing. It is difficult to make definitive statements on what kind of splicing is occurring (exon exclusion, intron inclusion, 5'/3' splicing, etc...). Upon arsenite stress, YB1's role in the nucleus (with respect to spliceosome function) is disrupted as it migrates to cytoplasm (where it functions in stress granules and/or enhanced translation complexes).
+
+
+```{r}
+spliceosome_genes <- str_split(goEnrichment_arsdmsoDown_cc.res %>% filter(ID == "GO:0005681") %>% pull(geneID) %>% c(), pattern = "/")
+# Convert gene symbols to Entrez IDs
+spliceosome_genes <- bitr(spliceosome_genes[[1]], fromType = "ENTREZID", 
+                    toType = c("UNIPROT","SYMBOL"), 
+                    OrgDb = org.Hs.eg.db)
+```
+
+
+```{r}
+
+yb1A673p1Hibit_dataMatrix
+
+```
+```{r}
+
+totalmRNA_switchObject <- read_rds(paste0(absPath_wd, "/dataFiles/totalmRNASwitchObject.rds"))
+combined_switchObject <- read_rds(paste0(absPath_wd, "/dataFiles/combinedSwitchObject.rds"))
+
+temp <- combined_switchObject$isoformSwitchAnalysis %>%
+  merge(combined_switchObject$isoformFeatures[,c(2:4)], all.x = TRUE) %>%
+  filter(condition_1 == "arsTotal", condition_2 == "arsPolyHeavy", padj <= 0.05) %>%
+  dplyr::select(gene_id, isoform_id, "ars_isoform_differential" = dIF, "ars_id_adjPval" = padj) %>%
+  mutate(isoform_id = str_match(isoform_id, "^([A-Za-z0-9]*)\\.")[,2])
+
+temp2 <- combined_switchObject$isoformSwitchAnalysis %>%
+  merge(combined_switchObject$isoformFeatures[,c(2:4)], all.x = TRUE) %>%
+  filter(condition_1 == "dmsoTotal", condition_2 == "dmsoPolyHeavy", padj <= 0.05) %>%
+  dplyr::select(gene_id, isoform_id, "dmso_isoform_differential" = dIF, "dmso_id_adjPval" = padj) %>%
+  mutate(isoform_id = str_match(isoform_id, "^([A-Za-z0-9]*)\\.")[,2])
+
+polyBinding_isoforms <- merge(temp, temp2)
+polyBindingUp_isoforms <- polyBinding_isoforms %>%
+  filter(ars_isoform_differential > 0, dmso_isoform_differential > 0)
+polyBindingDown_isoforms <- polyBinding_isoforms %>%
+  filter(ars_isoform_differential < 0, dmso_isoform_differential < 0)
+
+temp <- totalmRNA_switchObject$isoformSwitchAnalysis %>%
+  mutate(contrast = paste0(condition_2, "vs", condition_1)) %>%
+  dplyr::select(isoform_id, contrast, dIF, padj) %>%
+  pivot_wider(id_cols = c("isoform_id"), names_from = "contrast", values_from = c("dIF", "padj")) %>%
+  merge(totalmRNA_switchObject$isoformFeatures[,c("isoform_id", "gene_biotype", "gene_name")] %>% group_by(isoform_id) %>% dplyr::slice(1),
+        all.x = TRUE, by = "isoform_id")
+
+temp %>%
+  filter(padj_combovsars <= 0.05) %>%
+  mutate(isoform_id = str_match(isoform_id, "(.*)\\.")[,2],
+         polyAffinity = case_when(isoform_id %in% polyBindingUp_isoforms$isoform_id ~ "up",
+                                  isoform_id %in% polyBindingDown_isoforms$isoform_id ~ "down",
+                                  TRUE ~ NA)) %>%
+  merge(RipIsoformArsDmso_results[,c(1,2,6)], by.x = "isoform_id", by.y = "Row.names", all.x = TRUE) %>%
+  arrange(logFC)
+
+
+
+IsoformSwitchAnalyzeR::switchPlot(totalmRNA_switchObject, gene = "BACH1", condition1 = "dmso", condition2 = "ars")
+
+```
+```{r}
+temp <- yb1A673p1Hibit_dataMatrix %>%
+  filter(arsdmsopolysome_TPMlogFC > 0,
+         arsdmsoRip_TPMlogFC > 0) %>%
+  mutate(polySubTotal = arsdmsopolysome_TPMlogFC - arsdmsototalmRNA_TPMlogFC,
+         ripSubTotal = arsdmsoRip_TPMlogFC - arsdmsototalmRNA_TPMlogFC)
+
+tempUp <- temp %>%
+  filter(arsdmsoproteome_logFC >= 0,
+         arsdmsoproteome_adjpVal <= 0.05)
+
+tempDown <- temp %>%
+  filter(arsdmsoproteome_logFC <= 0,
+         arsdmsoproteome_adjpVal <= 0.05)
+
+temp3 <- temp %>% filter(gene_symbol %in% c("CPT1C", "STAT1", "RRM1", "EEF2", "MYO1B", "EIF3A", "IRS4", "IQGAP1", "TLN1"))
+
+temp %>%
+  ggplot(aes(x = ripSubTotal, y = polySubTotal))+
+  geom_point()+
+  geom_point(data = tempDown, color = "blue")+
+  geom_point(data = tempUp, color = "red")+
+  stat_ellipse(data = tempUp, color = "red")+
+  stat_ellipse(data = tempDown, color = "lightblue")+
+  geom_point(data = temp3, color = "green")+
+  geom_hline(yintercept = log2(1.5))+
+  geom_hline(yintercept = -log2(1.5))+
+  geom_vline(xintercept = log2(1.5))+
+  geom_vline(xintercept = -log2(1.5))
+
+temp2 <- temp %>% filter(ripSubTotal >= log2(1.5), polySubTotal >= log2(1.5)) %>% arrange(desc(polySubTotal))
+
+orderSheet_temp <- read_excel("F:\\Sorensen Lab\\Procurement\\Ordering\\Sorensen Lab - Order Request.xlsx", sheet = "Current Ordering Sheet")
+
+temp2 <- genes #temp2$gene_symbol[str_length(temp2$gene_symbol)>=4]
+tempList <- c()
+for (gene in yb1Stabilized_targets$gene_symbol){
+  tempList <- c(tempList, nrow(orderSheet_temp %>% filter(grepl(gene, x = `...8`, ignore.case = TRUE))) > 0)
+}
+yb1Stabilized_targets
+temp3 %>% dplyr::select(gene_symbol, contains("arsdmso"), polySubTotal, ripSubTotal)
+
+# cpt1c
+# STAT1
+# RRM1 (old)
+# eef2
+# myo1b
+# eif3a
+# IRS4
+# IQGAP1
+# TLN1
+
+
+```
+```{r}
+
+rAvenir_table <- read_excel(paste0(absPath_wd,"dataFiles/nar-00274-a-2017-RAvenir.xlsx"), skip = 1) %>% 
+  dplyr::rename("t_test" =`t-test Difference`, "negLogP" = `minusLog t-test p value`)
+temp <- yb1A673p1Hibit_dataMatrix %>%
+  merge(rAvenir_table %>% dplyr::select(`Gene names`, t_test, negLogP),
+        by.x = "gene_symbol", by.y = "Gene names", all.x = TRUE)
+tempList <- rAvenir_table[,grepl("^Intensity", colnames(rAvenir_table))] %>%
+  map_df(as.numeric) %>%
+  apply(1, function(x) sum(is.na(x)) < 3)
+polysomeAssociatedGenes <- rAvenir_table$`Gene names`[tempList] %>% na.omit()
+spliceGenes <- AnnotationDbi::select(org.Hs.eg.db, keys=c("GO:0008380"), columns = c('SYMBOL'), keytype = "GOALL")
+spliceGenes <- unique(spliceGenes$SYMBOL)
+
+### Which ones are differentially bound by YB-1 under arsenite stress
+yb1A673p1Hibit_dataMatrix %>%
+  ggplot(aes(x = arsdmsoRip_TPMlogFC))+
+  geom_density()+
+  geom_density(data = yb1A673p1Hibit_dataMatrix %>% filter(gene_symbol %in% polysomeAssociatedGenes, gene_symbol %in% spliceGenes), color = "red")
+
+```
+
+
+```{r}
+
+delattreMatrix.meta <- read_tsv(paste0(absPath_wd,"dataFiles/delattre_Ewing_expressionMatrix.txt"))[c(1,3,4,5,6),] %>% t()
+delattreMatrix.expression <- read_tsv(paste0(absPath_wd,"dataFiles/delattre_Ewing_expressionMatrix.txt"))[-c(1:6),-2] %>%
+  dplyr::rename("gene_symbol" = 1) %>%
+  filter(!grepl(";|-", gene_symbol)) %>%
+  column_to_rownames("gene_symbol") %>% t() %>%
+  as.data.frame()
+
+cor.results <- data.frame(gene_symbol = NA, cor = NA, p_val = NA)
+
+### Correlation analysis
+queryGenes <- colnames(delattreMatrix.expression)[!grepl(";|-", colnames(delattreMatrix.expression))]
+for (gene in queryGenes[queryGenes %in% colnames(delattreMatrix.expression)]){
+  res <- cor.test(delattreMatrix.expression["YBX1"] %>% pull(), delattreMatrix.expression[gene] %>% pull())
+  cor.results <- rbind(cor.results, c(gene, res$estimate, res$p.value))
+}
+cor.results <- cor.results %>% na.omit() %>%
+  mutate(cor = as.numeric(cor), p_val = as.numeric(p_val))
+cor.results["padj"] <- p.adjust(cor.results$p_val, "BH")
+
+# polySplice_genes <- polysomeAssociatedGenes[polysomeAssociatedGenes %in% spliceGenes]
+ribosomeBiogenesis_genes <- AnnotationDbi::select(org.Hs.eg.db, keys=c("GO:0042254"), columns = c('SYMBOL'), keytype = "GOALL") %>% pull(SYMBOL) %>% unique()
+
+cor.results.polysome <- cor.results %>% filter(gene_symbol %in% ribosomeBiogenesis_genes)
+cor.results.yb1Targets <- cor.results %>% filter(gene_symbol %in% genes[genes$uniprotswissprot %in% anyCond_Yb1RipTargets,"external_gene_name"])
+
+ggplot(cor.results, aes(x = cor))+
+  geom_density()+
+  geom_density(data = cor.results %>% filter(gene_symbol %in% ribosomeBiogenesis_genes), color = "red")
+cor.results.bootstrap <- data.frame(n = 1:5000)
+cor.results.bootstrap["corEstimate_mean"] <- apply(cor.results.bootstrap, 1, function(x){
+  mean(sample(cor.results.polysome %>% pull(cor), size = nrow(cor.results.polysome), replace = TRUE))
+})
+ggplot(data = cor.results.bootstrap)+
+  geom_histogram(aes(x = corEstimate_mean), fill = "green", color = "grey", bins = 200, size = 0.15)+
+  geom_vline(xintercept = mean(cor.results$cor), size = 1)+
+  geom_vline(xintercept = mean(cor.results.polysome$cor), size = 1, color = "#28803f")+
+  annotate(geom = "text", angle = 90, hjust = 0, label = paste0("Population Mean Correlation Coefficient = ",
+                                                     round(mean(cor.results$cor), 2)), x = 0.015, y = 10)+
+  annotate(geom = "text", angle = 90, hjust = 0, label = paste0("Ribosome-associated genes\nMean Correlation Coefficient = ",
+                                                     round(mean(cor.results.polysome$cor), 2)), x = 0.205, y = 40, color = "#28803f")+
+  lims(x = c(0, 0.3))+
+  theme_classic()+
+  labs(x = "Correlation coefficient to YBX1 (Pearson)", y = "Count")+
+  ggtitle("Bootstrap distribution")
+# ggsave(paste0(absPath_wd,"/plots/ribosome_bootstrapCorrelation.jpg"), height = 4.5, width = 3.5)
+
+```
+
+
+```{r}
+
+### Generate ranked list of YB-1 translation binding targets
+cor.results_ranked <- yb1A673p1Hibit_dataMatrix %>%
+  dplyr::select(uniprot_id, gene_symbol, contains("arsdmso")) %>%
+  merge(cor.results, by = "gene_symbol", all.x = TRUE) %>%
+  mutate(polySubTotal = arsdmsopolysome_TPMlogFC - arsdmsototalmRNA_TPMlogFC,
+         ripSubTotal = arsdmsoRip_TPMlogFC - arsdmsototalmRNA_TPMlogFC,
+         score = (-log10(arsdmsoRip_TPMadjpVal)*arsdmsoRip_TPMlogFC+log10(arsdmsopolysome_TPMadjpVal)*arsdmsopolysome_TPMlogFC)*cor,
+         score_adj = ripSubTotal-polySubTotal) %>%
+  filter(!is.na(cor), !is.na(arsdmsoRip_TPMlogFC)) %>%
+  arrange(desc(cor))
+
+cor.results %>% filter(grepl("RP[LS]", gene_symbol) & gene_symbol %in% ars_Yb1RipTargets$gene_symbol)
+
+```
+
+```{r}
+
+# Convert gene symbols to Entrez IDs
+geneEntrez_geneList <- bitr(cor.results %>% 
+                              filter(padj <= 0.05, cor > 0.25, gene_symbol %in% ars_Yb1RipTargets$gene_symbol) %>%
+                              pull(gene_symbol),
+                            fromType = "SYMBOL",
+                            toType = "ENTREZID",
+                            OrgDb = org.Hs.eg.db)
+# Perform GO enrichment analysis for the Cellular Component (CC) category
+goEnrichment_results <- enrichGO(gene         = geneEntrez_geneList$ENTREZID,
+                         OrgDb        = org.Hs.eg.db,
+                         ont          = "BP",      # Cellular compartment ontology
+                         pAdjustMethod = "BH",     # Benjamini-Hochberg correction
+                         pvalueCutoff  = 0.05,     # Adjust this based on your analysis
+                         qvalueCutoff  = 0.05)
+
+goEnrichment_results@result %>%
+  dplyr::select("Biological Process" = Description,
+                "Ratio in subset" = GeneRatio,
+                "Ratio in background" = BgRatio,
+                "Fold enrichment" = FoldEnrichment,
+                "Adjusted P-Value" = p.adjust) %>%
+  mutate(across(where(is.numeric), function(x) round(x, 2))) %>%
+  head(20) %>%
+  kableExtra::kable() %>%
+  kable_classic_2()
+  
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+yb1Stabilized_targets <- cor.results_ranked %>%
+  filter(padj <= 0.05, (cor) > 0.2, gene_symbol %in% anyCond_Yb1RipTargets) %>%
+  mutate(polySubTotal = arsdmsopolysome_TPMlogFC - arsdmsototalmRNA_TPMlogFC,
+         ripSubTotal = arsdmsoRip_TPMlogFC - arsdmsototalmRNA_TPMlogFC)
+yb1Stabilized_targets %>% dplyr::select(gene_symbol, "delattre_YBX1correlation" = cor,
+                                        "delattre_YBX1correlation_pval" = padj,
+                                        "arsenite to dmso RNA-IP logFC" = arsdmsoRip_TPMlogFC,
+                                        "arsenite to dmso RNA-IP pAdj" = arsdmsoRip_TPMadjpVal,
+                                        "arsenite to dmso polysome logFC" = arsdmsopolysome_TPMlogFC,
+                                        "arsenite to dmso polysome pAdj" = arsdmsopolysome_TPMadjpVal,
+                                        "yb1_stabilizing_score" = score) %>%
+  write_tsv(paste0(absPath_wd, "tables/ybx1StabilizingRankedTargets.tsv"))
+
+tempBackground <- yb1A673p1Hibit_dataMatrix %>%
+  mutate(polySubTotal = arsdmsopolysome_TPMlogFC - arsdmsototalmRNA_TPMlogFC,
+         ripSubTotal = arsdmsoRip_TPMlogFC - arsdmsototalmRNA_TPMlogFC)
+yb1Stabilized_polyCor <- cor.test(yb1Stabilized_targets$ripSubTotal,yb1Stabilized_targets$polySubTotal)
+tempBackground_polyCor <- cor.test(tempBackground$ripSubTotal,tempBackground$polySubTotal)
+yb1Stabilized_totalCor <- cor.test(yb1Stabilized_targets$ripSubTotal,yb1Stabilized_targets$arsdmsototalmRNA_TPMlogFC)
+tempBackground_totalCor <- cor.test(tempBackground$ripSubTotal,tempBackground$arsdmsototalmRNA_TPMlogFC)
+
+ggplot(tempBackground, mapping = aes(x = ripSubTotal, y = polySubTotal))+
+  geom_point(color = "#a8a8a8")+
+  geom_point(data = yb1Stabilized_targets, color = "#6ec285")+
+  geom_point(data = yb1Stabilized_targets, color = "black", shape = 1, size = 2)+
+  geom_smooth(method = "lm", color = "black", linetype = "dashed", se = FALSE)+
+  geom_smooth(data = yb1Stabilized_targets, method = "lm", color = "#2db812", linetype = "dashed", fullrange = TRUE, se = FALSE)+
+  theme_minimal()+
+  labs(x = "YBX1 RNA IP logFC (normalized to total mRNA logFC)",
+       y = "Polysome expression logFC \n (normalized to total mRNA logFC)")+
+  annotate(x = 2.5, y = -3, geom = "label", 
+           label = paste0("YB-1 targets", "\n",
+                          "R = ", round(yb1Stabilized_polyCor$estimate, 2), "\n",
+                          "p = ", round(yb1Stabilized_polyCor$p.value, 2)
+                          ), hjust = 0, label.padding = unit(0.75, "lines"), colour = "#28803f")+
+  annotate(x = -5, y = -2, geom = "label", 
+           label = paste0("Background", "\n",
+                          "R = ", round(tempBackground_polyCor$estimate, 2), "\n",
+                          "p = ", round(tempBackground_polyCor$p.value, 2)
+                          ), hjust = 0, label.padding = unit(0.75, "lines"), colour = "black")
+ggsave(paste0(absPath_wd, "/plots/yb1Targets_scatterplot_RipVsPoly.jpg"), width = 5, height = 5)
+
+ggplot(tempBackground, mapping = aes(x = ripSubTotal, y = arsdmsototalmRNA_TPMlogFC))+
+  geom_point(color = "#a8a8a8")+
+  geom_point(data = yb1Stabilized_targets, color = "#6ec285")+
+  geom_point(data = yb1Stabilized_targets, color = "black", shape = 1, size = 2)+
+  geom_smooth(method = "lm", color = "black", linetype = "dashed", se = FALSE)+
+  geom_smooth(data = yb1Stabilized_targets, method = "lm", color = "#2db812", linetype = "dashed", fullrange = TRUE, se = FALSE)+
+  theme_minimal()+
+  labs(x = "YBX1 RNA IP logFC (normalized to total mRNA logFC)",
+       y = "Total mRNA logFC")+
+  annotate(x = 4, y = 2.5, geom = "label", 
+           label = paste0("YB-1 targets", "\n",
+                          "R = ", round(yb1Stabilized_totalCor$estimate, 2), "\n",
+                          "p = ", round(yb1Stabilized_totalCor$p.value, 2)
+                          ), hjust = 0, label.padding = unit(0.75, "lines"), colour = "#28803f")+
+  annotate(x = -5.5, y = 5, geom = "label", 
+           label = paste0("Background", "\n",
+                          "R = ", round(tempBackground_totalCor$estimate, 2), "\n",
+                          "p = ", round(tempBackground_totalCor$p.value, 2)
+                          ), hjust = 0, label.padding = unit(0.75, "lines"), colour = "black")
+ggsave(paste0(absPath_wd, "/plots/yb1Targets_scatterplot_RipVstotalmRNA.jpg"), width = 5, height = 5)
+
+```
+
+```{r}
+
+ribosomeBiogenesis_genes <- AnnotationDbi::select(org.Hs.eg.db, keys=c("GO:0042254"), columns = c('SYMBOL'), keytype = "GOALL") %>% pull(SYMBOL) %>% unique()
+
+geneEntrez_geneList <- bitr(yb1Stabilized_targets$gene_symbol, fromType = "SYMBOL", 
+                    toType = "ENTREZID", 
+                    OrgDb = org.Hs.eg.db)
+
+goResults.bp <- enrichGO(gene = geneEntrez_geneList$ENTREZID,
+         OrgDb        = org.Hs.eg.db,
+         ont          = "BP",      # Cellular compartment ontology
+         pAdjustMethod = "BH",     # Benjamini-Hochberg correction
+         pvalueCutoff  = 0.05,     # Adjust this based on your analysis
+         qvalueCutoff  = 0.05)
+goResults.cc <- enrichGO(gene = geneEntrez_geneList$ENTREZID,
+         OrgDb        = org.Hs.eg.db,
+         ont          = "CC",      # Cellular compartment ontology
+         pAdjustMethod = "BH",     # Benjamini-Hochberg correction
+         pvalueCutoff  = 0.05,     # Adjust this based on your analysis
+         qvalueCutoff  = 0.05)
+goResults.bp@result
+
+yb1Stabilized_targets[yb1Stabilized_targets$gene_symbol %in% ribosomeBiogenesis_genes,]
+
+```
+
+
+```{r}
+
+syamNAR_psSeq <- read_excel(paste0(absPath_wd, "dataFiles/syamFiles_NARpaper/Table_S1_PSseq.xlsx"), sheet = 2, skip = 1) %>%
+  dplyr::select("gene_symbol"=gene_id, "psbound_logFC"= `log2(fold_change)`, "psbound_qVal"=q_value)
+syamNAR_g3bp1ArsAssociated_seq <- read_excel(paste0(absPath_wd, "dataFiles/syamFiles_NARpaper/Table_S4_RNAseq_G3BP1-APEX-ARS_G3BP1-APEX-UT.xlsx")) %>%
+  dplyr::select("gene_symbol"=gene_id, "g3bp1bound_logFC"= `log2(fold_change)`, "g3bp1bound_qVal"=q_value)
+syamNAR_totalmRNA_seq <- read_excel(paste0(absPath_wd, "dataFiles/syamFiles_NARpaper/Table_S2_RNAseq_Total RNA.xlsx"), sheet = 2, skip = 1) %>%
+  dplyr::select("gene_symbol"=gene, "totalmRNA_logFC"= `log2(fold_change)`, "totalmRNA_qVal"=q_value)
+syamNAR_mergedSeq <- merge(syamNAR_g3bp1ArsAssociated_seq, syamNAR_psSeq, all = TRUE) %>%
+  merge(syamNAR_totalmRNA_seq, all = TRUE) %>%
+  mutate(g3bp1SubTotal = g3bp1bound_logFC-totalmRNA_logFC, 
+         psSubTotal = psbound_logFC-totalmRNA_logFC)
+
+syamNAR_mergedSeq %>%
+  na.omit() %>%
+  ggplot(aes(x = psbound_logFC))+
+  geom_density(color = "red")+
+  # geom_density(data = filter(syamNAR_mergedSeq, gene_symbol %in% yb1Stabilized_targets$gene_symbol), color = "blue")
+  geom_density(data = filter(syamNAR_mergedSeq, grepl(x = gene_symbol, "MRP[LS]")), color = "blue")
+
+cor.test(syamNAR_mergedSeq$g3bp1SubTotal, syamNAR_mergedSeq$psSubTotal)
+
+```

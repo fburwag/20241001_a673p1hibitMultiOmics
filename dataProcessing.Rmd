@@ -1,0 +1,105 @@
+---
+title: "dataProcessing"
+author: "Fares Burwag"
+date: "10/09/2024"
+output: html_document
+---
+
+```{r}
+
+library(BiocManager)
+library(tidyverse)
+library(biomaRt)
+library(limma)
+library(fgsea)
+
+```
+
+
+```{r}
+
+absPath_wd <- "/Users/fburwag/Desktop/analysisWorkspace/hibitRip/"
+absPath_seqFiles <- paste0(absPath_wd,"/dataFiles/sequencing20230630_a673p1Ybx1Hibit/")
+# absPath_wd <- "F:/WorkFiles/hibitRip/hibitRip"
+# absPath_seqFiles <- paste0(absPath_wd,"/dataFiles/sequencing20230630_a673p1Ybx1Hibit/")
+
+sampleSheet <- read_tsv(paste0(absPath_seqFiles,"concatenated_summaryFiles.txt"), col_names = F) %>%
+  head(23) %>% select(X1,X2,X3,X7,X13) %>% as.matrix()
+
+sampleSheet <- rbind(sampleSheet,
+                     read_tsv(paste0(absPath_seqFiles,"concatenated_summaryFiles.txt"), col_names = F, skip = 23) %>%
+                       select(X1,X2,X3,X8,X15) %>% as.matrix()) %>% as.data.frame()
+colnames(sampleSheet) <- c("skip_1", "skip_2","keep_1","skip_3","keep_2")
+
+write_tsv(sampleSheet, paste0(absPath_seqFiles, "sampleSheet_processed.tsv"))
+
+
+```
+
+```{r}
+
+dataFileList <- list.files(absPath_seqFiles)
+dataFileList <- dataFileList[startsWith(dataFileList,"F")]
+
+## Initialize aggregation file
+sampleSheet <- read_tsv(paste0(absPath_seqFiles,"/sampleSheet_processed.tsv"))
+sampleSheet <- sampleSheet[,grepl("keep", colnames(sampleSheet))]
+
+aggData_temp <- data.frame()
+loop_counter <- 0
+for (sampleFile in dataFileList){
+  bioMeta_label <- sampleSheet$keep_2[sampleSheet$keep_1 == sampleFile]
+  if(nrow(aggData_temp)==0){
+    aggData_temp <- read_tsv(paste0(absPath_seqFiles,sampleFile,"/quant.sf"))
+    colnames(aggData_temp)[3+loop_counter] <- paste0("EffectiveLength_",bioMeta_label)
+    colnames(aggData_temp)[4+loop_counter] <- paste0("TPM_",bioMeta_label)
+    colnames(aggData_temp)[5+loop_counter] <- paste0("NumReads_",bioMeta_label)
+  }
+  else {
+    aggData_temp <- merge(aggData_temp,
+                          read_tsv(paste0(absPath_seqFiles,sampleFile,"/quant.sf")),
+                          all = TRUE, by = c("Name","Length"), suffixes = bioMeta_label)
+    colnames(aggData_temp)[3+loop_counter] <- paste0("EffectiveLength_",bioMeta_label)
+    colnames(aggData_temp)[4+loop_counter] <- paste0("TPM_",bioMeta_label)
+    colnames(aggData_temp)[5+loop_counter] <- paste0("NumReads_",bioMeta_label)
+  }
+  loop_counter <- loop_counter + 3
+}
+
+write_tsv(aggData_temp, paste0(absPath_wd,"/dataFiles/aggregatedSeqData.tsv"))
+
+```
+
+
+```{r}
+
+mart <- useMart(biomart = "ENSEMBL_MART_ENSEMBL", dataset = "hsapiens_gene_ensembl", host = 'https://www.ensembl.org')
+genes <- getBM(attributes = c("ensembl_transcript_id_version","external_gene_name", "chromosome_name","transcript_biotype", "uniprotswissprot"),
+                        filters = c("transcript_biotype","chromosome_name"),
+                        values = list("protein_coding",c(1:22,"X","Y","MT")), 
+                        mart = mart)
+proteins <- genes %>%
+  filter(!is.na(uniprotswissprot), !uniprotswissprot == "") %>%
+  group_by(uniprotswissprot) %>%
+  dplyr::slice(1) %>%
+  dplyr::select(chromosome_name, uniprotswissprot)
+# proteins["IDR_percent"] <- lapply(proteins$uniprotswissprot, function(x){
+#   iupred_res <- idpr::iupred(uniprotAccession = x, plotResults = FALSE)
+#   sum(iupred_res$IUPred2>0.5)/length(iupred_res$IUPred2)
+# }) %>% unlist()
+
+write_tsv(genes, paste0(absPath_wd,"/dataFiles/ensemblTranscriptIDgeneSymbol.tsv"))
+
+```
+
+
+```{r}
+
+gene_list <- "RNASEH1	LOC101929882	RRM2	ODC1	SNORA80B	LOC101929715	FAM98A	ZFP36L2	CAMKMT	WDR92	MXD1	PCBP1	PRADC1	LOC101927826	TET3	LOC100630918	LOC102724805	ANKRD36B	TXNDC9	REV1	RANBP2	MIR1302-3	CERS6	SLC25A12	AC074286	DTYMK	LOC101927187	ING5	SCN5A	SNORA6	RASSF1-AS1	LOC101929159	CCDC58	PDIA5	SNORA7B	RP11-85F14	PFN2	TIPARP"
+gsub("\t", "\n", gene_list) %>%
+writeLines()
+
+
+```
+
+

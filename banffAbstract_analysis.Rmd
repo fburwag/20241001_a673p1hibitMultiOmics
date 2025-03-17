@@ -1,0 +1,127 @@
+---
+title: "banffAbstract_analysis"
+author: "Fares Burwag"
+date: "04/03/2025"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+yb1A673p1Hibit_dataMatrix
+
+```
+
+```{r}
+
+delattreMatrix.meta <- read_tsv(paste0(absPath_wd,"dataFiles/delattre_Ewing_expressionMatrix.txt"))[c(1,3,4,5,6),] %>% t()
+delattreMatrix.expression <- read_tsv(paste0(absPath_wd,"dataFiles/delattre_Ewing_expressionMatrix.txt"))[-c(1:6),-2] %>%
+  dplyr::rename("gene_symbol" = 1) %>%
+  filter(!grepl(";|-", gene_symbol)) %>%
+  column_to_rownames("gene_symbol") %>% t() %>%
+  as.data.frame()
+
+cor.results <- data.frame(gene_symbol = NA, cor = NA, p_val = NA)
+
+### Correlation analysis
+queryGenes <- colnames(delattreMatrix.expression)[!grepl(";|-", colnames(delattreMatrix.expression))]
+for (gene in queryGenes[queryGenes %in% colnames(delattreMatrix.expression)]){
+  res <- cor.test(delattreMatrix.expression["YBX1"] %>% pull(), delattreMatrix.expression[gene] %>% pull())
+  cor.results <- rbind(cor.results, c(gene, res$estimate, res$p.value))
+}
+cor.results <- cor.results %>% na.omit() %>%
+  mutate(cor = as.numeric(cor), p_val = as.numeric(p_val))
+cor.results["padj"] <- p.adjust(cor.results$p_val, "BH")
+
+# polySplice_genes <- polysomeAssociatedGenes[polysomeAssociatedGenes %in% spliceGenes]
+ribosomeBiogenesis_genes <- AnnotationDbi::select(org.Hs.eg.db, keys=c("GO:0042254"), columns = c('SYMBOL'), keytype = "GOALL") %>% pull(SYMBOL) %>% unique()
+
+cor.results.polysome <- cor.results %>% filter(gene_symbol %in% ribosomeBiogenesis_genes)
+cor.results.yb1Targets <- cor.results %>% filter(gene_symbol %in% genes[genes$uniprotswissprot %in% anyCond_Yb1RipTargets,"external_gene_name"])
+
+ggplot(cor.results, aes(x = cor))+
+  geom_density()+
+  geom_density(data = cor.results %>% filter(gene_symbol %in% ribosomeBiogenesis_genes), color = "red")
+cor.results.bootstrap <- data.frame(n = 1:5000)
+cor.results.bootstrap["corEstimate_mean"] <- apply(cor.results.bootstrap, 1, function(x){
+  mean(sample(cor.results.polysome %>% pull(cor), size = nrow(cor.results.polysome), replace = TRUE))
+})
+ggplot(data = cor.results.bootstrap)+
+  geom_histogram(aes(x = corEstimate_mean), fill = "green", color = "grey", bins = 200, size = 0.15)+
+  geom_vline(xintercept = mean(cor.results$cor), size = 1)+
+  geom_vline(xintercept = mean(cor.results.polysome$cor), size = 1, color = "#28803f")+
+  annotate(geom = "text", angle = 90, hjust = 0, label = paste0("Population Mean Correlation Coefficient = ",
+                                                     round(mean(cor.results$cor), 2)), x = 0.015, y = 10)+
+  annotate(geom = "text", angle = 90, hjust = 0, label = paste0("Ribosome-associated genes\nMean Correlation Coefficient = ",
+                                                     round(mean(cor.results.polysome$cor), 2)), x = 0.205, y = 40, color = "#28803f")+
+  lims(x = c(0, 0.3))+
+  theme_classic()+
+  labs(x = "Correlation coefficient to YBX1 (Pearson)", y = "Count")+
+  ggtitle("Bootstrap distribution")
+
+```
+
+```{r}
+
+# Convert gene symbols to Entrez IDs
+geneEntrez_geneList <- bitr(cor.results %>% 
+                              filter(padj <= 0.05, cor > 0.2, gene_symbol %in% ars_Yb1RipTargets$gene_symbol) %>%
+                              pull(gene_symbol),
+                            fromType = "SYMBOL",
+                            toType = "ENTREZID",
+                            OrgDb = org.Hs.eg.db)
+# Perform GO enrichment analysis for the Cellular Component (CC) category
+goEnrichment_results <- enrichGO(gene         = geneEntrez_geneList$ENTREZID,
+                         OrgDb        = org.Hs.eg.db,
+                         ont          = "BP",      # Cellular compartment ontology
+                         pAdjustMethod = "BH",     # Benjamini-Hochberg correction
+                         pvalueCutoff  = 0.05,     # Adjust this based on your analysis
+                         qvalueCutoff  = 0.05)
+
+goEnrichment_results@result %>%
+  dplyr::select("Biological Process" = Description,
+                "Ratio in subset" = GeneRatio,
+                "Ratio in background" = BgRatio,
+                "Fold enrichment" = FoldEnrichment,
+                "Adjusted P-Value" = p.adjust) %>%
+  mutate(across(where(is.numeric), function(x) round(x, 2))) %>%
+  head(20) %>%
+  kableExtra::kable() %>%
+  kable_classic_2()
+
+```
+
+```{r}
+
+temp <- cor.results %>% filter(padj <= 0.05, gene_symbol %in% ars_Yb1RipTargets$gene_symbol)
+
+yb1A673p1Hibit_dataMatrix %>%
+  ggplot(aes(x = arsdmsoRip_TPMlogFC, arsdmsopolysome_TPMlogFC))+
+  geom_point(alpha = 0.1)+
+  geom_point(data = yb1A673p1Hibit_dataMatrix %>%
+               filter(gene_symbol %in% temp$gene_symbol),
+             color = "blue")+
+  ggrepel::geom_label_repel(data = yb1A673p1Hibit_dataMatrix %>%
+                              filter(gene_symbol %in% c("MRPL37", "MRPS15", "NFE2L2", "FOXM1", "MRPL42", "HMOX1", "ACTB")),
+                            aes(label = gene_symbol), box.padding = 0.5, max.overlaps = Inf, force = 1,
+                            position = position_nudge_center(x = 2, center_x = 0, y = 2, center_y = 0))+
+  geom_point(data = yb1A673p1Hibit_dataMatrix %>%
+                              filter(gene_symbol %in% c("MRPL37", "MRPS15", "NFE2L2", "FOXM1", "MRPL42", "HMOX1", "ACTB")),
+                            color = "red")+
+  theme_minimal()+
+  labs(x = "logFC RNA IP (Arsenite - DMSO)", y = "logFC Polysome (Arsenite - DMSO)")
+
+ggsave("../plots/temp.png", width = 4, height = 4)
+
+```
+
+```{r}
+
+
+
+```
+
+

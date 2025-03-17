@@ -1,0 +1,94 @@
+---
+title: "scriptToProcessDelattre"
+author: "Fares Burwag"
+date: "30/01/2025"
+output: html_document
+---
+
+
+```{r}
+
+library(BiocManager)
+library(tidyverse)
+library(biomaRt)
+library(limma)
+library(fgsea)
+library(ggrepel)
+library(ggpp)
+library(pheatmap)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(preprocessCore)
+library(readxl)
+library(RColorBrewer)
+library(survival)
+library(survminer)
+
+# library(ConsensusClusterPlus)
+absPath_wd <- "/Users/fburwag/Desktop/analysisWorkspace/hibitRip/"
+
+```
+
+
+```{r}
+
+delattre_metadata <- read_tsv(paste0(absPath_wd, "dataFiles/delattre_data/Clinical_data_GSE34620.txt"))
+colnames(delattre_metadata) <- c("cohort_id", "sample_id", "diagnosisAge", "is_relapse", "FPS", "OS",
+                              "is_dead", "causeOfDeath", "lifeStat", "trmo_binary")
+
+delattre_matrix <- read_tsv(paste0(absPath_wd, "dataFiles/delattre_data/GSE34620_series_matrix.txt"), skip = 63)
+delattre_index <- read_tsv(paste0(absPath_wd, "dataFiles/delattre_data/GPL570-55999.txt"), skip = 16)
+delattre_matrix_clean <- delattre_matrix %>% merge(dIndex_temp, all.x = TRUE, by.x = "ID_REF", by.y = "ID") %>%
+  group_by(`Gene Symbol`) %>%
+  summarize(across(where(is.numeric), function(x) sum(x, na.rm = T)))
+
+# temp <- delattre_matrix_clean %>% filter(`Gene Symbol` == "YBX1") %>% dplyr::select(contains("GSM")) %>%
+#   apply(1, function(x) scale(x))
+
+```
+
+
+
+```{r}
+
+geneSpecific_data <- delattre_matrix_clean %>% filter(`Gene Symbol` %in% c("YBX1")) %>%
+  column_to_rownames("Gene Symbol") %>%
+  t() %>% as.data.frame() %>%
+  merge(delattre_metadata, by.x = "row.names", by.y = "sample_id")
+
+survObj <- surv_fit(Surv(time = OS, event = is_dead) ~ ybx1_binary,
+                    data = geneSpecific_data)
+ggsurvplot(survObj,conf.int = T)
+
+summaryTable_surv <- data.frame()
+for (threshold in seq(0,1,0.05)){
+  loop_data <- geneSpecific_data %>%
+    mutate(ybx1_binary = case_when(YBX1 >= quantile(geneSpecific_data$YBX1, threshold) ~ "High",
+                                 YBX1 < quantile(geneSpecific_data$YBX1, (1-threshold)) ~ "Low",
+                                 TRUE ~ NA))
+  loop_survObj <- surv_fit(Surv(time = OS, event = is_dead) ~ ybx1_binary,
+                    data = loop_data)
+  loop_new <- c(threshold, surv_pvalue(loop_survObj) %>% pull(pval))
+  summaryTable_surv <- summaryTable_surv %>% rbind(loop_new)
+}
+
+colnames(summaryTable_surv) <- c("threshold", "pValue")
+summaryTable_surv["padj"] <- summaryTable_surv$pValue %>% p.adjust(method = "BH")
+arrange(summaryTable_surv, padj)
+## Use a threshold of 0.5
+
+```
+
+
+```{r}
+
+survData <- geneSpecific_data %>%
+    mutate(ybx1_binary = case_when(YBX1 >= quantile(geneSpecific_data$YBX1, 0.5) ~ "High",
+                                 YBX1 < quantile(geneSpecific_data$YBX1, (1-0.5)) ~ "Low",
+                                 TRUE ~ NA))
+survObj <- surv_fit(Surv(time = OS, event = is_dead) ~ ybx1_binary,
+                    data = survData)
+ggsurvplot(survObj)
+  
+```
+

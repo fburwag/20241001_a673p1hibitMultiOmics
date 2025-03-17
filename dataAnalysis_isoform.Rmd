@@ -1,0 +1,437 @@
+---
+title: "dataAnalysis"
+author: "Fares Burwag"
+date: "11/09/2024"
+output: html_document
+---
+
+
+```{r}
+
+library(BiocManager)
+library(tidyverse)
+library(biomaRt)
+library(limma)
+library(fgsea)
+library(tidymodels)
+library(ggrepel)
+library(ggpp)
+library(pheatmap)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(preprocessCore)
+library(readxl)
+library(RColorBrewer)
+library(IsoformSwitchAnalyzeR)
+
+absPath_wd <- "/Users/fburwag/Desktop/analysisWorkspace/hibitRip/"
+absPath_seqFiles <- paste0(absPath_wd,"/dataFiles/sequencing20230630_a673p1Ybx1Hibit/")
+# absPath_wd <- "F:/WorkFiles/hibitRip/hibitRip"
+# absPath_seqFiles <- paste0(absPath_wd,"/dataFiles/sequencing20230630_a673p1Ybx1Hibit/")
+absPath_wd <- "/Users/faresburwag/Desktop/BioinformaticsLearning/hibitRip/"
+absPath_seqFiles <- paste0(absPath_wd,"dataFiles/sequencing20230630_a673p1Ybx1Hibit/")
+
+genes <- read_tsv(paste0(absPath_wd, "dataFiles/ensemblTranscriptIDgeneSymbol.tsv")) %>%
+  mutate(ensembl_transcript_id_version = str_match(ensembl_transcript_id_version, "^([A-Za-z0-9]*)\\.")[,2])
+
+```
+
+
+```{r}
+
+isoformAnalyzerInput.tpm <- aggData_processed %>%
+  dplyr::select(1, contains("TPM")) %>%
+  dplyr::select(1, contains("Total"))
+colnames(isoformAnalyzerInput.tpm) <- c("isoform_id", str_match(colnames(isoformAnalyzerInput.tpm)[-1], "TPM_(.*)")[,2])
+
+isoformAnalyzerInput.abundance <- aggData_processed %>%
+  dplyr::select(1, contains("NumReads")) %>%
+  dplyr::select(1, contains("Total"))
+colnames(isoformAnalyzerInput.abundance) <- c("isoform_id", str_match(colnames(isoformAnalyzerInput.abundance)[-1], "NumReads_(.*)")[,2])
+
+design <- data.frame(
+    sampleID = colnames(isoformAnalyzerInput.tpm)[-1],
+    condition = str_match(colnames(isoformAnalyzerInput.tpm)[-1], "(.*)Total")[,2]
+)
+
+
+aSwitchList <- importRdata(
+    isoformCountMatrix   = isoformAnalyzerInput.tpm,
+    isoformRepExpression = isoformAnalyzerInput.abundance,
+    designMatrix         = design,
+    isoformExonAnnoation = "../dataFiles/gencode.v45.annotation.gtf.gz",
+    isoformNtFasta       = "../dataFiles/gencode.v45.transcripts.fa.gz",
+    fixStringTieAnnotationProblem = TRUE,
+    showProgress = FALSE,
+    comparisonsToMake = data.frame(condition_1 = c("dmso","ars"),
+                                   condition_2 = c("ars", "combo"))
+)
+
+totalmRNASwitchList <- isoformSwitchAnalysisPart1(
+    switchAnalyzeRlist   = aSwitchList,
+    # pathToOutput = 'path/to/where/output/should/be/'
+    outputSequences      = TRUE,
+    prepareForWebServers = FALSE)
+totalmRNA_switchList_analyzed <- IsoformSwitchAnalyzeR::analyzeIntronRetention(totalmRNASwitchList)
+totalmRNA_switchList_analyzed <- IsoformSwitchAnalyzeR::analyzeSwitchConsequences(totalmRNA_switchList_analyzed, 
+                                                 consequencesToAnalyze = c("intron_retention", "NMD_status"))
+write_rds(totalmRNA_switchList_analyzed, paste0(absPath_wd, "dataFiles/totalmRNASwitchObject.rds"))
+
+```
+
+```{r}
+
+
+isoformAnalyzerInput.tpm <- aggData_processed %>%
+  dplyr::select(1, contains("TPM")) %>%
+  dplyr::select(1, contains("Rip")) %>%
+  dplyr::select(1, !contains("neg"))
+
+colnames(isoformAnalyzerInput.tpm) <- c("isoform_id", str_match(colnames(isoformAnalyzerInput.tpm)[-1], "TPM_(.*)")[,2])
+
+isoformAnalyzerInput.abundance <- aggData_processed %>%
+  dplyr::select(1, contains("NumReads")) %>%
+  dplyr::select(1, contains("Rip")) %>%
+  dplyr::select(1, !contains("neg"))
+colnames(isoformAnalyzerInput.abundance) <- c("isoform_id", str_match(colnames(isoformAnalyzerInput.abundance)[-1], "NumReads_(.*)")[,2])
+
+design <- data.frame(
+    sampleID = colnames(isoformAnalyzerInput.tpm)[-1],
+    condition = str_match(colnames(isoformAnalyzerInput.tpm)[-1], "(.*)Rip")[,2]
+)
+
+
+aSwitchList_RnaIp <- importRdata(
+    isoformCountMatrix   = isoformAnalyzerInput.tpm,
+    isoformRepExpression = isoformAnalyzerInput.abundance,
+    designMatrix         = design,
+    isoformExonAnnoation = "../dataFiles/gencode.v45.annotation.gtf.gz",
+    isoformNtFasta       = "../dataFiles/gencode.v45.transcripts.fa.gz",
+    fixStringTieAnnotationProblem = TRUE,
+    showProgress = FALSE,
+    comparisonsToMake = data.frame(condition_1 = c("dmso","ars"),
+                                   condition_2 = c("ars", "combo"))
+)
+
+rnaIpSwitchList <- isoformSwitchAnalysisPart1(
+    switchAnalyzeRlist   = aSwitchList_RnaIp,
+    # pathToOutput = 'path/to/where/output/should/be/'
+    outputSequences      = TRUE,
+    prepareForWebServers = FALSE)
+
+write_rds(rnaIpSwitchList, paste0(absPath_wd, "dataFiles/rnaIPSwitchObject.rds"))
+
+```
+
+```{r}
+
+
+isoformAnalyzerInput.tpm <- aggData_processed %>%
+  dplyr::select(1, contains("TPM")) %>%
+  dplyr::select(1, contains("Poly")) %>%
+  dplyr::select(1, !contains("neg"))
+
+colnames(isoformAnalyzerInput.tpm) <- c("isoform_id", str_match(colnames(isoformAnalyzerInput.tpm)[-1], "TPM_(.*)")[,2])
+
+isoformAnalyzerInput.abundance <- aggData_processed %>%
+  dplyr::select(1, contains("NumReads")) %>%
+  dplyr::select(1, contains("Poly")) %>%
+  dplyr::select(1, !contains("neg"))
+colnames(isoformAnalyzerInput.abundance) <- c("isoform_id", str_match(colnames(isoformAnalyzerInput.abundance)[-1], "NumReads_(.*)")[,2])
+
+design <- data.frame(
+    sampleID = colnames(isoformAnalyzerInput.tpm)[-1],
+    condition = str_match(colnames(isoformAnalyzerInput.tpm)[-1], "(.*)Poly")[,2]
+)
+
+
+aSwitchList_Poly <- importRdata(
+    isoformCountMatrix   = isoformAnalyzerInput.tpm,
+    isoformRepExpression = isoformAnalyzerInput.abundance,
+    designMatrix         = design,
+    isoformExonAnnoation = "../dataFiles/gencode.v45.annotation.gtf.gz",
+    isoformNtFasta       = "../dataFiles/gencode.v45.transcripts.fa.gz",
+    fixStringTieAnnotationProblem = TRUE,
+    showProgress = FALSE,
+    comparisonsToMake = data.frame(condition_1 = c("dmso","ars"),
+                                   condition_2 = c("ars", "combo"))
+)
+
+PolySwitchList <- isoformSwitchAnalysisPart1(
+    switchAnalyzeRlist   = aSwitchList_Poly,
+    # pathToOutput = 'path/to/where/output/should/be/'
+    outputSequences      = TRUE,
+    prepareForWebServers = FALSE)
+
+write_rds(PolySwitchList, paste0(absPath_wd, "dataFiles/polySwitchObject.rds"))
+```
+
+```{r}
+
+aggPolysomeIsoform_data <- aggData_processed %>%
+  dplyr::select(1, contains("TPM")) %>%
+  dplyr::select(1, contains("Poly")) %>%
+  mutate(Name = str_match(Name, "^([A-Za-z0-9]*)\\.")[,2]) %>%
+  merge(genes[,c(1,2)], all.y = TRUE, by.x = "Name", by.y = "ensembl_transcript_id_version") %>%
+  dplyr::select(-external_gene_name)
+aggPolysomeIsoform_data <- aggPolysomeIsoform_data[!duplicated(aggPolysomeIsoform_data$Name),]
+row.names(aggPolysomeIsoform_data) <- NULL
+
+sampleLabels <- c(str_match(colnames(aggPolysomeIsoform_data)[2:ncol(aggPolysomeIsoform_data)],"TPM_(.*)Poly.")[,2])
+
+designMat <- model.matrix(~0+sampleLabels,
+                            data=aggPolysomeIsoform_data[,2:ncol(aggPolysomeIsoform_data)])
+colnames(designMat) = gsub('sampleLabels','',colnames(designMat))
+
+limmaDataMat <- aggPolysomeIsoform_data[,c(1,2:ncol(aggPolysomeIsoform_data))] %>%
+  column_to_rownames("Name") %>%
+  apply(2,function(x){log2(x+0.1)}) %>%
+  as.data.frame()
+polysomeIsoform_fit = lmFit(limmaDataMat, design = designMat)
+
+contrasts <- apply(combn(rev(unique(sampleLabels)), 2), 2, function(x) paste0(x[1],"-",x[2]))
+
+contrast.matrix = makeContrasts(contrasts = contrasts, levels=designMat)
+polysomeIsoform_fit = contrasts.fit(polysomeIsoform_fit, contrast.matrix)
+polysomeIsoform_fit = eBayes(polysomeIsoform_fit)
+
+polysomeIsoformArsDmso_results <- topTable(polysomeIsoform_fit, coef = "ars-dmso", number = 10^8) %>%
+  merge(genes[,c(1,2)], all.y = TRUE, by.x = "row.names", by.y = "ensembl_transcript_id_version")
+
+```
+
+
+```{r}
+
+aggRipIsoform_data <- aggData_processed %>%
+  dplyr::select(1, contains("TPM")) %>%
+  dplyr::select(1, contains("neg"), contains("Rip")) %>%
+  mutate(Name = str_match(Name, "^([A-Za-z0-9]*)\\.")[,2]) %>%
+  merge(genes[,c(1,2)], all.y = TRUE, by.x = "Name", by.y = "ensembl_transcript_id_version") %>%
+  dplyr::select(-external_gene_name, -TPM_negInput, -TPM_negRip)
+aggRipIsoform_data <- aggRipIsoform_data[!duplicated(aggRipIsoform_data$Name),]
+row.names(aggRipIsoform_data) <- NULL
+sampleLabels <- c(str_match(colnames(aggRipIsoform_data)[2:ncol(aggRipIsoform_data)],"TPM_(.*)Rip.")[,2])
+
+designMat <- model.matrix(~0+sampleLabels,
+                            data=aggRipIsoform_data[,2:ncol(aggRipIsoform_data)])
+colnames(designMat) = gsub('sampleLabels','',colnames(designMat))
+
+limmaDataMat <- aggRipIsoform_data[,c(1,2:ncol(aggRipIsoform_data))] %>%
+  column_to_rownames("Name") %>%
+  apply(2,function(x){log2(x+0.1)}) %>%
+  as.data.frame()
+RipIsoform_fit = lmFit(limmaDataMat, design = designMat)
+
+contrasts <- apply(combn(rev(unique(sampleLabels)), 2), 2, function(x) paste0(x[1],"-",x[2]))
+
+contrast.matrix = makeContrasts(contrasts = contrasts, levels=designMat)
+RipIsoform_fit = contrasts.fit(RipIsoform_fit, contrast.matrix)
+RipIsoform_fit = eBayes(RipIsoform_fit)
+
+RipIsoformArsDmso_results <- topTable(RipIsoform_fit, coef = "ars-dmso", number = 10^8) %>%
+  merge(genes[,c(1,2)], all.y = TRUE, by.x = "row.names", by.y = "ensembl_transcript_id_version")
+
+```
+
+```{r}
+
+aggRipIsoform_data <- aggData_processed %>%
+  dplyr::select(1, contains("TPM")) %>%
+  dplyr::select(1, contains("neg"), contains("Rip")) %>%
+  mutate(Name = str_match(Name, "^([A-Za-z0-9]*)\\.")[,2]) %>%
+  merge(genes[,c(1,2)], all.y = TRUE, by.x = "Name", by.y = "ensembl_transcript_id_version") %>%
+  dplyr::select(-external_gene_name)
+aggRipIsoform_data <- aggRipIsoform_data[!duplicated(aggRipIsoform_data$Name),]
+row.names(aggRipIsoform_data) <- NULL
+
+sampleLabels <- c("negInput","negRIP",str_match(colnames(aggRipIsoform_data)[4:ncol(aggRipIsoform_data)],"TPM_(.*)(Rip).")[,2])
+
+designMat <- model.matrix(~0+sampleLabels,
+                            data=aggRipIsoform_data[,2:ncol(aggRipIsoform_data)])
+colnames(designMat) = gsub('sampleLabels','',colnames(designMat))
+
+limmaDataMat <- aggRipIsoform_data %>%
+  column_to_rownames("Name") %>%
+  apply(2,function(x){log2(x+0.1)}) %>%
+  as.data.frame()
+negRipIsoform_fit = lmFit(limmaDataMat, design = designMat)
+
+contrasts <- apply(combn(rev(unique(sampleLabels)), 2), 2, function(x) paste0(x[1],"-",x[2]))
+contrasts <- contrasts[grepl("neg(Input|RIP)$",contrasts)]
+
+contrast.matrix = makeContrasts(contrasts = contrasts, levels=designMat)
+negRipIsoform_fit = contrasts.fit(negRipIsoform_fit, contrast.matrix)
+negRipIsoform_fit = eBayes(negRipIsoform_fit)
+
+
+for (condition in c("dmso","ars","ms275","combo")){
+  loopTable_1 <- topTable(negRipIsoform_fit, coef = paste0(condition,"-negRIP"), number = nrow(aggRipIsoform_data)) %>%
+    filter(logFC>logFC_threshold, adj.P.Val <= 0.05) %>%
+    dplyr::select("negRIP_logFC"=logFC, "negRIP_adjPVal"=adj.P.Val)
+  loopTable_2 <- topTable(negRipIsoform_fit, coef = paste0(condition,"-negInput"), number = nrow(aggRipIsoform_data)) %>%
+    filter(logFC>logFC_threshold, adj.P.Val <= 0.05) %>%
+    dplyr::select("negInput_logFC"=logFC, "negInput_adjPVal"=adj.P.Val)
+  loopTable_out <- merge(loopTable_1, loopTable_2, by="row.names") %>%
+    dplyr::rename("Name" = Row.names)
+  assign(paste0(condition,"isoform_Yb1RipTargets"), loopTable_out)
+}
+
+anyCondIsoform_Yb1RipTargets <- unique(c(arsisoform_Yb1RipTargets$Name,
+                                  dmsoisoform_Yb1RipTargets$Name,
+                                  comboisoform_Yb1RipTargets$Name,
+                                  ms275isoform_Yb1RipTargets$Name))
+
+data.frame(condition = c("dmso", "ms275", "arsenite", "combo", "anyCondition"),
+           rnaIpTargets = c(paste(dmsoisoform_Yb1RipTargets$Name, collapse = ","),
+                            paste(ms275isoform_Yb1RipTargets$Name, collapse = ","),
+                            paste(arsisoform_Yb1RipTargets$Name, collapse = ","),
+                            paste(comboisoform_Yb1RipTargets$Name, collapse = ","),
+                            paste(anyCondIsoform_Yb1RipTargets, collapse = ","))) %>%
+  write_lines(paste0(absPath_wd, "dataFiles/yb1_rnaIPTargets_isoform.txt"))
+
+```
+
+```{r trash}
+
+temp <- totalmRNA_switchList_analyzed$isoformSwitchAnalysis %>%
+  merge(totalmRNA_switchList_analyzed$isoformFeatures[,c(2:4)], all.x = TRUE) %>%
+  filter(condition_1 == "dmso", condition_2 == "ars", padj < 0.05) %>%
+  dplyr::select(gene_id, isoform_id, "total_isoform_differential" = dIF, "total_id_adjPval" = padj) %>%
+  mutate(isoform_id = str_match(isoform_id, "^([A-Za-z0-9]*)\\.")[,2])
+
+temp2 <- PolySwitchList$isoformSwitchAnalysis %>%
+  merge(PolySwitchList$isoformFeatures[,c(2:4)], all.x = TRUE) %>%
+  filter(condition_1 == "dmso", condition_2 == "ars") %>%
+  dplyr::select(gene_id, isoform_id, "poly_isoform_differential" = dIF, "poly_id_adjPval" = padj) %>%
+  mutate(isoform_id = str_match(isoform_id, "^([A-Za-z0-9]*)\\.")[,2])
+temp3 <- merge(temp, temp2)
+
+# isoformDifferentialPoly_results <- polysomeIsoformArsDmso_results %>%
+#   select("isoform_id" = Row.names, "polyLogFC" = logFC, "poly_adjPval" = `adj.P.Val`, "gene_id" = external_gene_name) %>%
+#   # filter(gene_id %in% temp$gene_id) %>%
+#   merge(temp, by = c("isoform_id", "gene_id")) %>%
+#   filter(poly_adjPval <= 0.05) %>%
+#   arrange(gene_id)
+
+ggplot(temp3, aes(x = poly_isoform_differential, y = total_isoform_differential))+
+  geom_point()+
+  geom_point(data = temp3 %>% filter(gene_id %in% anyCondIsoform_Yb1RipTargets),
+             color = "green", shape = 1)
+
+```
+
+```{r}
+
+### Let's treat polysome and total mRNA as two different 'treatments' - Filter for the arsenite condition
+isoformAnalyzerInput.tpm <- aggData_processed %>%
+  dplyr::select(1, contains("TPM"))
+isoformAnalyzerInput.tpm <- isoformAnalyzerInput.tpm[,c(TRUE, grepl(".*(ars|dmso)(Poly|Total)", colnames(isoformAnalyzerInput.tpm[-1])))]
+colnames(isoformAnalyzerInput.tpm) <- c("isoform_id", str_match(colnames(isoformAnalyzerInput.tpm)[-1], "TPM_(.*)")[,2])
+
+isoformAnalyzerInput.abundance <- aggData_processed %>%
+  dplyr::select(1, contains("NumReads"))
+isoformAnalyzerInput.abundance <- isoformAnalyzerInput.abundance[,c(TRUE, grepl(".*(ars|dmso)(Poly|Total)", colnames(isoformAnalyzerInput.abundance[-1])))]
+colnames(isoformAnalyzerInput.abundance) <- c("isoform_id", str_match(colnames(isoformAnalyzerInput.abundance)[-1], "NumReads_(.*)")[,2])
+
+design <- data.frame(
+    sampleID = colnames(isoformAnalyzerInput.tpm)[-1],
+    condition = str_match(colnames(isoformAnalyzerInput.tpm)[-1], "(.*)[1-3]$")[,2]
+)
+
+
+combinedSwitchList_Poly <- importRdata(
+    isoformCountMatrix   = isoformAnalyzerInput.tpm,
+    isoformRepExpression = isoformAnalyzerInput.abundance,
+    designMatrix         = design,
+    isoformExonAnnoation = "../dataFiles/gencode.v45.annotation.gtf.gz",
+    isoformNtFasta       = "../dataFiles/gencode.v45.transcripts.fa.gz",
+    fixStringTieAnnotationProblem = TRUE,
+    showProgress = FALSE,
+    comparisonsToMake = data.frame(condition_1 = c("dmsoTotal","arsTotal"),
+                                   condition_2 = c("dmsoPolyHeavy", "arsPolyHeavy"))
+)
+
+combinedSwitchList <- isoformSwitchAnalysisPart1(
+    switchAnalyzeRlist   = combinedSwitchList_Poly,
+    # pathToOutput = 'path/to/where/output/should/be/'
+    outputSequences      = TRUE,
+    prepareForWebServers = FALSE)
+
+combinedSwitchList_analyzed <- IsoformSwitchAnalyzeR::analyzeIntronRetention(combinedSwitchList)
+combinedSwitchList_analyzed <- IsoformSwitchAnalyzeR::analyzeSwitchConsequences(combinedSwitchList_analyzed, 
+                                                 consequencesToAnalyze = c("intron_retention", "NMD_status"))
+write_rds(combinedSwitchList_analyzed, paste0(absPath_wd, "dataFiles/combinedSwitchObject.rds"))
+```
+
+```{r}
+
+temp <- combinedSwitchList_analyzed$isoformSwitchAnalysis %>%
+  merge(combinedSwitchList_analyzed$isoformFeatures[,c(2:4)], all.x = TRUE) %>%
+  filter(condition_1 == "arsTotal", condition_2 == "arsPolyHeavy", padj <= 0.05) %>%
+  dplyr::select(gene_id, isoform_id, "ars_isoform_differential" = dIF, "ars_id_adjPval" = padj) %>%
+  mutate(isoform_id = str_match(isoform_id, "^([A-Za-z0-9]*)\\.")[,2])
+
+temp2 <- combinedSwitchList_analyzed$isoformSwitchAnalysis %>%
+  merge(combinedSwitchList_analyzed$isoformFeatures[,c(2:4)], all.x = TRUE) %>%
+  filter(condition_1 == "dmsoTotal", condition_2 == "dmsoPolyHeavy", padj <= 0.05) %>%
+  dplyr::select(gene_id, isoform_id, "dmso_isoform_differential" = dIF, "dmso_id_adjPval" = padj) %>%
+  mutate(isoform_id = str_match(isoform_id, "^([A-Za-z0-9]*)\\.")[,2])
+
+polyBinding_isoforms <- merge(temp, temp2)
+polyBindingUp_isoforms <- polyBinding_isoforms %>%
+  filter(ars_isoform_differential > 0, dmso_isoform_differential > 0)
+polyBindingDown_isoforms <- polyBinding_isoforms %>%
+  filter(ars_isoform_differential < 0, dmso_isoform_differential < 0)
+
+totalmRNA_switchRes_filtered <- totalmRNA_switchList_analyzed$isoformSwitchAnalysis %>%
+  merge(totalmRNA_switchList_analyzed$isoformFeatures[,c(2:4)], all.x = TRUE) %>%
+  merge(totalmRNA_switchList_analyzed$intronRetentionAnalysis[,c(1,2)], all.x = TRUE) %>%
+  filter(condition_1 == "dmso", condition_2 == "ars", padj < 0.05) %>%
+  dplyr::select(gene_id, isoform_id, "total_isoform_differential" = dIF, "total_id_adjPval" = padj,
+                "retained_introns" = IR) %>%
+  mutate(isoform_id = str_match(isoform_id, "^([A-Za-z0-9]*)\\.")[,2],
+         IR_binary = retained_introns > 0)
+
+ggplot(totalmRNA_switchRes_filtered, aes(y = -log10(total_id_adjPval), x = total_isoform_differential, color = IR_binary))+
+  geom_point()+
+  geom_point(data = totalmRNA_switchRes_filtered %>% filter(isoform_id %in% polyBindingUp_isoforms$isoform_id),
+             shape = 1, color = "green")+
+  geom_point(data = totalmRNA_switchRes_filtered %>% filter(isoform_id %in% polyBindingDown_isoforms$isoform_id),
+             shape = 1, color = "red")+
+  facet_grid(.~IR_binary)
+
+temp <- totalmRNA_switchList_analyzed$switchConsequence %>%
+  filter(condition_1 == "dmso", condition_2 == "ars", isoformsDifferent) %>%
+  select(gene_id, switchConsequence)
+temp2 <- yb1A673p1Hibit_dataMatrix %>%
+  filter(arsdmsopolysome_TPMadjpVal <= 0.05, gene_symbol %in% anyCondIsoform_Yb1RipTargets) %>%
+  merge(temp, by.x = "gene_symbol", by.y = "gene_id", all.x = TRUE)
+temp2 %>% ggplot(aes(x = arsdmsopolysome_TPMlogFC, y = -log10(arsdmsopolysome_TPMadjpVal)))+
+  geom_point()+
+  geom_point(data = temp2 %>% filter(switchConsequence == "Intron retention loss"), color = "red")+
+  geom_point(data = temp2 %>% filter(switchConsequence == "NMD sensitive"), color = "green")
+
+
+```
+
+```{r}
+
+intron_retained <- totalmRNA_switchList_analyzed$switchConsequence %>%
+  filter(condition_1 == "dmso", condition_2 == "ars", isoformsDifferent,
+         switchConsequence == "Intron retention loss") %>%
+  pull(gene_id)
+
+ggplot(polyBinding_isoforms, 
+       aes(x = ars_isoform_differential, y = dmso_isoform_differential))+
+  geom_point()+ 
+  geom_point(data = polyBinding_isoforms %>% filter(gene_id %in% anyCondIsoform_Yb1RipTargets),
+             color = "green", shape = 1)
+
+IsoformSwitchAnalyzeR::switchPlot(totalmRNASwitchList, gene = "CLK1", condition1 = "ars", condition2 = "dmso")
+IsoformSwitchAnalyzeR::switchPlot(totalmRNASwitchList, gene = "IP6K2", condition1 = "ars", condition2 = "dmso")
+
+```
+
+
